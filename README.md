@@ -1,1 +1,118 @@
 # nearAI_Isabelle
+
+An Isabelle/HOL port of [nearai/putnambench-deepseek](https://github.com/nearai/putnambench-deepseek):
+the same single-tool-loop agent harness (`agentlib.py`, vendored), the same
+"only the verifier can end the run" rule, but the agent proves **Isabelle**
+theorems through the [Isabelle Pool Server](https://github.com/Deep-LCF/Isabelle-Pool-Server)
+LSP MCP instead of running Lean in bash.
+
+The purpose of the repository is one controlled experiment:
+
+> Does forcing the agent to work **skeleton-first** -- write an Isar skeleton
+> with `sorry` at every leaf, let the server's `fill_sorries` run sledgehammer
+> on all of them at once, iterate on the survivors -- prove more theorems (or
+> the same theorems cheaper) than letting it call sledgehammer one goal at a
+> time?
+
+Two arms, identical in everything but how sledgehammer is reached
+(`harness/arms.py`):
+
+| arm | sledgehammer access | automatic? |
+|---|---|---|
+| `plain` | `isabelle_sledgehammer(line, subgoal)` on one open goal | no |
+| `skeleton` | `fill_sorries` on every `sorry` in the file; no per-goal tool | yes: every `write_file` that parses cleanly and still has `sorry`s is filled and written back |
+| `fill_optional` (extra) | both | no |
+
+In every arm the harness **enforces** the solver rule: `write_file` rejects a
+`metis` / `smt` / `meson` / `moura` call that did not come out of a
+sledgehammer or fill result during the attempt. The model cannot shortcut the
+comparison by hand-writing ATP proofs.
+
+See [docs/experiment-design.md](docs/experiment-design.md) for the design,
+the benchmark choice and the open decisions.
+
+## Layout
+
+| path | what |
+|---|---|
+| `agentlib.py` | vendored upstream agent loop (+ `apikey_file`, token-usage capture; marked `[nearAI_Isabelle]`) |
+| `run_isabelle_solver.py` | the harness: stages a problem, starts the LSP MCP, registers the tools of the arm, runs the agent, re-verifies, appends `runs/results.jsonl` |
+| `harness/ib.py` | benchmark side (the `pb.py` port): manifest, staging, **verifier**, subset selection, flock queue |
+| `harness/arms.py` | the arms: tool allow-lists, auto-fill flag, strategy prompts |
+| `harness/mcp_bridge.py` | sync wrapper over one MCP stdio server (agentlib is synchronous) |
+| `scripts/statement_probe.py` | LLM-free pass: does the statement parse under Isabelle2026, does bare sledgehammer already close it |
+| `analyze.py` | per-arm / per-category tables, paired per-problem comparison with McNemar |
+| `benchmarks/` | (gitignored) miniF2F and PutnamBench checkouts |
+| `runs/` | (gitignored) bench dirs, `results.jsonl`, `defects/` |
+
+## Setup
+
+```bash
+# 1. the prover: Isabelle Pool Server running on :8000 with the heaps the
+#    benchmark needs (miniF2F: HOL-Number_Theory covers everything;
+#    PutnamBench also needs HOL-Analysis, HOL-Algebra, HOL-Combinatorics)
+cd ~/GitHub/Isabelle-Pool-Server && docker compose up -d
+docker compose exec -T isabelle-pool-server isabelle build -b HOL-Number_Theory
+
+# 2. this repo
+cd ~/GitHub/nearAI_Isabelle
+python3 -m venv .venv && .venv/bin/pip install "mcp>=1.2,<2" requests pyyaml httpx \
+    -e ~/GitHub/Isabelle-Pool-Server/client
+cp config/model.example.json config/model.json     # DeepSeek via apikey_file (or paste "apikey")
+
+# 3. benchmarks + manifest
+git clone --depth 1 --filter=blob:none --sparse https://github.com/facebookresearch/miniF2F benchmarks/minif2f
+( cd benchmarks/minif2f && git sparse-checkout set isabelle )
+git clone --depth 1 --filter=blob:none --sparse https://github.com/trishullab/PutnamBench benchmarks/putnambench
+( cd benchmarks/putnambench && git sparse-checkout set isabelle informal )
+.venv/bin/python harness/ib.py prepare --source minif2f --root benchmarks/minif2f/isabelle --split test
+.venv/bin/python harness/ib.py prepare --source putnambench --root benchmarks/putnambench/isabelle
+.venv/bin/python harness/ib.py selftest
+```
+
+## Run
+
+```bash
+# probe (no LLM): parse check + sledgehammer-only baseline, writes probe.json
+.venv/bin/python scripts/statement_probe.py --source minif2f --split test --sh-timeout 60
+
+# pick the pilot subset: 60 miniF2F-test problems, stratified by category,
+# dropping the ones sledgehammer closes alone and the ones that do not parse
+.venv/bin/python harness/ib.py select --source minif2f --probe probe.json \
+    --exclude-unparsed --exclude-sh-trivial --n 60 --stratify category --out subsets/pilot.txt
+
+# one problem, one arm
+.venv/bin/python run_isabelle_solver.py --problem mathd_algebra_276 --arm skeleton
+
+# the experiment: queue every (problem, arm) pair, run 2 workers
+.venv/bin/python harness/ib.py queue-init --subset subsets/pilot.txt --arm plain skeleton --repeats 1
+for i in 1 2; do nohup .venv/bin/python run_isabelle_solver.py --loop 0 > runs/worker$i.log 2>&1 & done
+.venv/bin/python harness/ib.py queue-status
+
+# results
+.venv/bin/python analyze.py --pair plain skeleton
+```
+
+Budgets default to `--max-steps 150 --timeout 3600` per attempt (upstream ran
+unbounded; this is a comparison on a laptop-class server). Two workers is the
+practical ceiling on a 16 GB host: each attempt holds one Isabelle session
+(1.5-4 GB) plus the sledgehammer provers.
+
+## What counts as solved
+
+`completed()` (and the harness again after the run) passes only when, for the
+final `.thy`:
+
+1. no `sorry`/`oops` outside comments and no escape hatch (`axiomatization`,
+   `ML*`, `setup`, `oracle`, `declare [[...]]`, `notation`/`syntax`, `hide_*`,
+   `consts`, ...);
+2. the theory header and the theorem statement are the frozen ones (comments
+   stripped, whitespace normalized) and the theorem keeps its name;
+3. no helper definition reuses a name that occurs in the statement (Isabelle
+   lets a local `definition prime` shadow the imported one);
+4. the whole theory builds (`isabelle build`, through the Pool Server's
+   bigstep endpoint).
+
+PutnamBench's factored answers follow upstream: `wsolution` inlines the
+reference answer (leaderboard setting), `full` leaves `undefined` for the agent
+to replace with the type frozen.

@@ -1,0 +1,8 @@
+{
+  "host": "https://api.deepseek.com/chat/completions",
+  "model": "deepseek-v4-pro",
+  "apikey_file": "/Users/winstonren/GitHub/Isabelle-Pool-Server/evaluation/MCP-comparison/deepseek_api.txt",
+  "context_window": 1000000,
+  "merge_reasoning": false,
+  "compact_at": 0.8
+}

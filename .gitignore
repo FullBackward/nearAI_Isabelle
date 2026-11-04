@@ -1,0 +1,21 @@
+# model configs hold API keys
+.nearai.*
+config/model*.json
+!config/model.example.json
+# the benchmarks are cloned, not vendored
+benchmarks/
+# run artifacts
+runs/
+db.sql
+*.sqlite
+problems.tsv
+probe*.json
+# python
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+# derived from benchmarks/ (absolute paths); regenerate with ib.py prepare
+harness/manifest.json
+harness/problems.tsv
+harness/problems.lock
