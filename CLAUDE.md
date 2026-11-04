@@ -12,13 +12,15 @@ docs/experiment-design.md the design and open decisions.
 
 ## Architecture
 
-- `agentlib.py` -- vendored upstream, do not refactor. Two additions marked `[nearAI_Isabelle]`
-  (`apikey_file`, `USAGE_LOG`).
+- `agentlib.py` -- vendored upstream, do not refactor. Additions marked `[nearAI_Isabelle]`:
+  `apikey_file`, `USAGE_LOG`, and the `CHAT_SINK`/`TOOL_SINK` hooks (`_stream_chat` wraps
+  `_stream_chat_inner`) that the harness points at each attempt's `transcript.jsonl`.
 - `run_isabelle_solver.py` -- the harness. One attempt = stage (`ib.cmd_stage`) -> start the LSP
   MCP through `harness/mcp_bridge.MCPBridge` -> `isabelle_open` -> register tools
   (`read_file`/`write_file`, the arm's MCP tools with `file_path` injected, `completed`,
   `disproved`/`write_disproof`) -> `agent.run` with `should_continue` nudging -> re-verify ->
-  append `runs/results.jsonl`. The solver rule lives in `extract_solver_calls` /
+  write `transcript.jsonl` + `transcript.md` into the bench dir (`_Transcript`,
+  `_render_transcript_md`) and append `runs/results.jsonl`. The solver rule lives in `extract_solver_calls` /
   `sanctioned_from_output`; the skeleton arm's automatic fill in `_auto_fill`.
 - `harness/arms.py` -- the only place arms differ: `mcp_tools`, `auto_fill`, `strategy`.
 - `harness/ib.py` -- manifest (`prepare`), staging (proof stripping via `sorryfy` /

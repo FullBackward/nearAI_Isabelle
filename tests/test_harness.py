@@ -142,3 +142,48 @@ def test_system_prompt_for_multi_target_entry(tmp_path):
     txt = rs._system_prompt(at2)
     assert "3 theorems" in txt and "t_three" in txt and "EVERY `sorry`" in txt
     assert "IMO 2026" in txt
+
+
+def test_transcript_records_everything(tmp_path, monkeypatch):
+    """Fake model: one turn calls a tool, the next stops. The jsonl must carry
+    the exact request (system prompt, tool schemas, every message) and reply
+    (reasoning, tool call) per call, plus the tool execution; the markdown must
+    show all of it, untruncated."""
+    replies = [
+        ({"role": "assistant", "content": "", "reasoning_content": "let me add",
+          "tool_calls": [{"id": "c1", "type": "function",
+                          "function": {"name": "add", "arguments": '{"a": 2, "b": 3}'}}]}, "tool_calls"),
+        ({"role": "assistant", "content": "five, done"}, "stop"),
+    ]
+    monkeypatch.setattr(agentlib, "_stream_chat_inner", lambda *a, **k: replies.pop(0))
+    reg = agentlib.ToolRegistry()
+    reg.register("add", "adds", {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}},
+                 lambda a, b: a + b)
+    cfg = agentlib.AgentConfig(host="http://x/chat", model="fake", apikey="k")
+    agent = agentlib.Agent(cfg, reg, db_path=str(tmp_path / "db.sql"), agent_name="isa-test")
+    tr = rs._Transcript(tmp_path / "transcript.jsonl")
+    monkeypatch.setattr(agentlib, "CHAT_SINK", tr)
+    monkeypatch.setattr(agentlib, "TOOL_SINK", tr)
+    res = agent.run("add two and three", system_prompt="SYSTEM PROMPT TEXT", max_steps=5)
+    assert res.finish_reason == "stop"
+
+    recs = [json.loads(l) for l in (tmp_path / "transcript.jsonl").read_text().splitlines()]
+    assert [r["kind"] for r in recs] == ["chat", "tool", "chat"]
+    first = recs[0]["request"]
+    assert first["messages"][0] == {"role": "system", "content": "SYSTEM PROMPT TEXT"}
+    assert first["messages"][1]["content"] == "add two and three"
+    assert first["tools"][0]["function"]["name"] == "add"
+    assert recs[0]["response"]["reasoning_content"] == "let me add"
+    assert recs[0]["response"]["tool_calls"][0]["function"]["name"] == "add"
+    assert recs[1]["name"] == "add" and recs[1]["result"] == "5" and recs[1]["error"] is None
+    # the second request carries the tool result back to the model
+    roles = [m["role"] for m in recs[2]["request"]["messages"]]
+    assert roles == ["system", "user", "assistant", "tool"]
+    assert recs[2]["request"]["messages"][3]["content"] == "5"
+
+    rows = rs._trajectory_rows(agent, "isa-test")
+    md = rs._render_transcript_md(rows, tr.calls, {"problem": "p", "arm": "plain", "rep": 0})
+    for needle in ("SYSTEM PROMPT TEXT", "add two and three", "let me add", "tool call `add`",
+                   "tool result `add`", "five, done", "## Model calls"):
+        assert needle in md, needle
+    agent.close()

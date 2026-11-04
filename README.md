@@ -45,7 +45,7 @@ the benchmark choice and the open decisions.
 | `problems/imo2026/` | the six IMO 2026 problems: `isabelle/` our Isabelle/HOL statements (see its README), `lean/` the AxiomMath Lean statements they translate |
 | `analyze.py` | per-arm / per-category tables, paired per-problem comparison with McNemar |
 | `benchmarks/` | (gitignored) miniF2F and PutnamBench checkouts |
-| `runs/` | (gitignored) bench dirs, `results.jsonl`, `defects/` |
+| `runs/` | (gitignored) bench dirs with per-attempt `transcript.jsonl` (every model request and reply, every tool call) and `transcript.md`, `results.jsonl`, `defects/` |
 | `scripts/ips-field-from-imports.patch` | the IPS change the harness relies on (`FIELD_FROM_IMPORTS`), kept for checkouts that predate its commit |
 | `docs/server-runbook.md` | running the whole thing on a remote (SSH-only) server |
 

@@ -366,6 +366,26 @@ class TrajectoryStore:
 # added during it. Summaries requested for compaction land here too.
 USAGE_LOG: list[dict] = []
 
+# [nearAI_Isabelle] Full-record hooks. CHAT_SINK receives one dict per model
+# call: the exact request body (minus the key) -- model, every message
+# including the system prompt, the tool schemas, extra kwargs -- plus the
+# assembled reply (content, reasoning_content, tool_calls, error), the finish
+# reason, the usage block and timing. TOOL_SINK receives one dict per tool
+# execution (name, arguments, result, error, timing). The harness points both
+# at a per-attempt transcript.jsonl; None (the default) switches them off.
+CHAT_SINK: Optional[Callable[[dict], None]] = None
+TOOL_SINK: Optional[Callable[[dict], None]] = None
+
+
+def _emit(sink: Optional[Callable[[dict], None]], rec: dict) -> None:
+    """[nearAI_Isabelle] Call a sink; a recording failure must never stop a run."""
+    if sink is None:
+        return
+    try:
+        sink(rec)
+    except Exception as e:  # noqa: BLE001
+        print(f"[agentlib] transcript sink failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
 
 # How much of a failed response body to keep. Providers put the actual reason
 # in there -- "image file is truncated", "context length exceeded", "invalid
@@ -402,7 +422,7 @@ def _error_detail(resp) -> str:
     return body[:_ERR_BODY_CHARS].strip()
 
 
-def _stream_chat(
+def _stream_chat_inner(
     config: AgentConfig, messages: list[dict], tools: list[dict],
     request_kwargs: Optional[dict] = None,
     connect_timeout: float = 10.0,
@@ -572,6 +592,39 @@ def _stream_chat(
     if tool_calls:
         message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
 
+    return message, finish_reason
+
+
+def _stream_chat(
+    config: AgentConfig, messages: list[dict], tools: list[dict],
+    request_kwargs: Optional[dict] = None,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 120.0,
+    max_retries: int = 3,
+) -> tuple[dict, str]:
+    """[nearAI_Isabelle] `_stream_chat_inner` plus the CHAT_SINK record. The
+    record is taken AFTER the call so it carries the final reply (or the error
+    reply after the retries) and the usage row the stream delivered; the
+    request side is a deep copy made here, before the loop mutates the
+    assistant message (the finish_reason="length" rewrite) or compacts."""
+    started = datetime.now(timezone.utc)
+    t0 = time.time()
+    mark = len(USAGE_LOG)
+    message, finish_reason = _stream_chat_inner(
+        config, messages, tools, request_kwargs,
+        connect_timeout=connect_timeout, read_timeout=read_timeout,
+        max_retries=max_retries)
+    if CHAT_SINK is not None:
+        snap = lambda x: json.loads(json.dumps(x, default=str, ensure_ascii=False))  # noqa: E731
+        _emit(CHAT_SINK, {
+            "kind": "chat",
+            "started": started.isoformat(), "elapsed_s": round(time.time() - t0, 3),
+            "request": {"model": config.model, "host": config.host,
+                        "messages": snap(messages), "tools": snap(tools or []),
+                        "kwargs": snap(request_kwargs or {})},
+            "response": snap(message), "finish_reason": finish_reason,
+            "usage": USAGE_LOG[-1] if len(USAGE_LOG) > mark else None,
+        })
     return message, finish_reason
 
 
@@ -958,12 +1011,17 @@ class Agent:
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
                 fn_args = tc["function"].get("arguments", "")
+                _t_tool = time.time()  # [nearAI_Isabelle]
                 try:
                     result = self.registry.invoke(fn_name, fn_args)
                     err = None
                 except Exception as e:  # noqa: BLE001 - record, don't crash
                     result = f"ERROR: {type(e).__name__}: {e}"
                     err = type(e).__name__
+                _emit(TOOL_SINK, {  # [nearAI_Isabelle]
+                    "kind": "tool", "step": step_idx, "tool_call_id": tc.get("id"),
+                    "name": fn_name, "arguments": fn_args, "result": result,
+                    "error": err, "elapsed_s": round(time.time() - _t_tool, 3)})
 
                 tool_msg = {
                     "role": "tool",

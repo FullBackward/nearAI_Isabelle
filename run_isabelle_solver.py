@@ -632,6 +632,104 @@ a disproof filed to escape a hard proof is worse than useless.
 
 
 # --------------------------------------------------------------------------- #
+# Full transcript of an attempt
+# --------------------------------------------------------------------------- #
+# Two files per attempt in its bench dir. `transcript.jsonl` is the raw record:
+# one line per model call (the exact request body -- system prompt, every
+# message, the tool schemas -- and the assembled reply with reasoning_content,
+# tool_calls, finish_reason, usage, timing) and one line per tool execution
+# (arguments, result, timing), in the order they happened, written as they
+# happen so a timeout or crash loses nothing. `transcript.md` is the same
+# conversation rendered for reading, from the SQLite trajectory (every message
+# once, in order, compactions marked) plus a per-call table from the jsonl.
+
+class _Transcript:
+    """The sink both agentlib hooks write to; appends and flushes per record."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.n = 0
+        self.calls: list[dict] = []
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    def __call__(self, rec: dict) -> None:
+        self.n += 1
+        rec = {"n": self.n, **rec}
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        if rec["kind"] == "chat":
+            u = rec.get("usage") or {}
+            self.calls.append({"n": self.n, "finish": rec.get("finish_reason"),
+                               "prompt": u.get("prompt_tokens"), "completion": u.get("completion_tokens"),
+                               "cached": u.get("cached_tokens"), "elapsed_s": rec.get("elapsed_s"),
+                               "error": (rec.get("response") or {}).get("error")})
+
+
+_FENCE = "~~~~"
+
+
+def _fenced(s: object) -> str:
+    text = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False, indent=1, default=str)
+    return f"{_FENCE}\n{text}\n{_FENCE}\n"
+
+
+def _render_transcript_md(rows: list[dict], calls: list[dict], header: dict) -> str:
+    """Markdown of a whole attempt: header, per-call table, then every
+    trajectory message in order. Nothing is truncated -- the point of the
+    file is that everything the model saw and said is in it."""
+    out = [f"# Transcript: {header.get('problem')} / {header.get('arm')} / rep{header.get('rep')}\n",
+           "| | |\n|---|---|\n" + "".join(f"| {k} | {v} |\n" for k, v in header.items()), ""]
+    if calls:
+        out.append("## Model calls\n\n| call | finish | prompt | completion | cached | s | error |\n|---|---|---|---|---|---|---|")
+        for c in calls:
+            out.append(f"| {c['n']} | {c['finish']} | {c['prompt']} | {c['completion']} | {c['cached']} | "
+                       f"{c['elapsed_s']} | {(c['error'] or '')[:80]} |")
+        out.append("")
+    step = 0
+    for i, m in enumerate(rows):
+        role = m.get("role")
+        if role == "system":
+            out.append(f"## [{i}] system prompt\n" + _fenced(m.get("content")))
+        elif role == "user":
+            out.append(f"## [{i}] user\n" + _fenced(m.get("content")))
+        elif role == "assistant":
+            step += 1
+            out.append(f"## [{i}] assistant (turn {step})")
+            if m.get("error"):
+                out.append("**error:** " + _fenced(m["error"]))
+            if m.get("reasoning_content"):
+                out.append("### reasoning\n" + _fenced(m["reasoning_content"]))
+            if m.get("content"):
+                out.append("### content\n" + _fenced(m["content"]))
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments", "")
+                try:
+                    args = json.dumps(json.loads(args), ensure_ascii=False, indent=1)
+                except Exception:  # noqa: BLE001
+                    pass
+                out.append(f"### tool call `{fn.get('name')}` ({tc.get('id')})\n" + _fenced(args))
+        elif role == "tool":
+            out.append(f"## [{i}] tool result `{m.get('name')}` ({m.get('tool_call_id')})\n" + _fenced(m.get("content")))
+        elif role == "compaction":
+            out.append(f"## [{i}] compaction (what the model sees from here on)\n" + _fenced(m.get("stats")))
+        else:
+            out.append(f"## [{i}] {role}\n" + _fenced(m))
+    return "\n".join(out) + "\n"
+
+
+def _trajectory_rows(agent: "agentlib.Agent", agent_name: str) -> list[dict]:
+    """All messages of this attempt's trajectory, found by its unique agent
+    name (the result object is missing after a timeout)."""
+    cur = agent.store._conn.execute(
+        "SELECT payload FROM messages WHERE trajectory_id = "
+        "(SELECT id FROM trajectories WHERE agent_name=? ORDER BY created_at DESC LIMIT 1) ORDER BY seq ASC",
+        (agent_name,))
+    return [json.loads(r[0]) for r in cur.fetchall()]
+
+
+# --------------------------------------------------------------------------- #
 # One attempt
 # --------------------------------------------------------------------------- #
 
@@ -732,8 +830,11 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
             _register_file_tools(reg, at)
             _register_mcp_tools(reg, at, available)
             _register_finishing_tools(reg, at)
-            agent = agentlib.Agent(cfg, reg, db_path=args.db,
-                                   agent_name=f"isa-{arm_name}-{problem}-rep{rep}")
+            agent_name = f"isa-{arm_name}-{problem}-rep{rep}"
+            agent = agentlib.Agent(cfg, reg, db_path=args.db, agent_name=agent_name)
+            transcript = _Transcript(bench_dir / "transcript.jsonl")
+            agentlib.CHAT_SINK = transcript
+            agentlib.TOOL_SINK = transcript
 
             user_input = (
                 f"Solve the problem '{problem}' ({entry['source']}): replace every `sorry` in "
@@ -765,6 +866,17 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
             finally:
                 if args.timeout:
                     signal.alarm(0)
+                agentlib.CHAT_SINK = None
+                agentlib.TOOL_SINK = None
+            try:
+                md = _render_transcript_md(
+                    _trajectory_rows(agent, agent_name), transcript.calls,
+                    {"problem": problem, "arm": arm_name, "rep": rep, "variant": variant, "model": cfg.model,
+                     "started": started.isoformat(), "finish_reason": getattr(result, "finish_reason", "timeout"),
+                     "steps": getattr(result, "num_steps", None)})
+                (bench_dir / "transcript.md").write_text(md, encoding="utf-8")
+            except Exception as e:                       # noqa: BLE001
+                print(f"[harness] transcript.md not written: {type(e).__name__}: {e}", flush=True)
             compactions = agent.store._conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE trajectory_id=? AND role='compaction'",
                 (result.trajectory_id if result else "",)).fetchone()[0]
@@ -827,6 +939,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
         "setup_error": setup_error, "compactions": compactions,
         "tokens": tokens,
         "bench_dir": str(bench_dir),
+        "transcript": str(bench_dir / "transcript.jsonl") if (bench_dir / "transcript.jsonl").exists() else None,
     }
     if at is not None:
         row.update({
