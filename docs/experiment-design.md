@@ -82,6 +82,44 @@ Statistics: pass@1 per arm; per-problem paired outcome with the exact McNemar
 test on discordant pairs (`analyze.py --pair plain skeleton`); category
 breakdown; effort metrics on the problems both arms solved.
 
+## IMO 2026 tier (added 2026-11-04)
+
+The owner wants the harness scored on the six IMO 2026 problems, because the
+published IMO 2026 harnesses (AxiomProver, MechMath, humanfia, …) are all scored on
+the same formal statements -- AxiomMath/IMO2026's `problem.lean` files -- and a
+partial set would not be comparable. `problems/imo2026/isabelle/` holds Isabelle/HOL
+translations of all six (P1 is the pre-existing verified file from
+`isabelle-humanize`; P2–P6 are new, deviations listed in the folder README);
+`problems/imo2026/lean/` keeps the Lean originals. To keep the comparison strict
+the Isabelle files carry exactly what the Lean files carry: the formal statement
+and the per-definition docstrings, no informal problem text, and the prompt's
+informal-statement slot is empty for this source.
+
+What differs from miniF2F/PutnamBench files:
+
+- **Multi-target.** P1 states five theorems and P3 six (sanity statements plus
+  the main one), with auxiliary definitions. As in the Lean `verify.py`, a
+  problem is solved only when *every* `sorry` is gone, every definition block
+  and every statement is unchanged, and the whole file builds. `ib.py` freezes
+  all of them (`targets`, `sigs`, `frozen_blocks`, `pristine_defs` in the
+  manifest entry; `_multi_target_checks` in the verifier).
+- **Heaps.** P2 needs `HOL-Analysis`, P4 `HOL-Library`; the rest build on `HOL`
+  or `HOL-Computational_Algebra`.
+- **Statistics.** Six problems cannot separate the arms on pass rate; the tier
+  is a showcase and a per-problem case study (steps, tokens, fills, wall time
+  per arm, several repeats). The miniF2F pilot remains the statistical
+  comparison.
+- **Expected difficulty.** P1 was solved by DeepSeek V4 Pro in `isabelle-humanize`
+  (1059-line proof, ~$5). P5 is pure real algebra and within reach. P4 and P3
+  are game/combinatorics arguments with real-valued encodings; P6 is a hard
+  number-theory result; P2 is synthetic geometry on `real^2`, where
+  sledgehammer is weak. A realistic outcome is P1 and P5 solved, the others
+  not, in both arms.
+
+Validation (2026-11-04): all six statement files build via
+`scripts/bigstep_check.py` against the server (HOL-Analysis and HOL-Library
+heaps built on the server for the purpose; see `runs/bigstep_check_imo2026.log`).
+
 ## Open decisions (for review)
 
 1. Benchmark: miniF2F-test pilot (recommended) vs a PutnamBench slice first.

@@ -41,9 +41,13 @@ the benchmark choice and the open decisions.
 | `harness/arms.py` | the arms: tool allow-lists, auto-fill flag, strategy prompts |
 | `harness/mcp_bridge.py` | sync wrapper over one MCP stdio server (agentlib is synchronous) |
 | `scripts/statement_probe.py` | LLM-free pass: does the statement parse under Isabelle2026, does bare sledgehammer already close it |
+| `scripts/bigstep_check.py` | LLM-free, session-free: does a statement file build through the server's bigstep endpoint (quick_and_dirty injected so `sorry` is tolerated) |
+| `problems/imo2026/` | the six IMO 2026 problems: `isabelle/` our Isabelle/HOL statements (see its README), `lean/` the AxiomMath Lean statements they translate |
 | `analyze.py` | per-arm / per-category tables, paired per-problem comparison with McNemar |
 | `benchmarks/` | (gitignored) miniF2F and PutnamBench checkouts |
 | `runs/` | (gitignored) bench dirs, `results.jsonl`, `defects/` |
+| `scripts/ips-field-from-imports.patch` | the IPS change the harness relies on (`FIELD_FROM_IMPORTS`), kept for checkouts that predate its commit |
+| `docs/server-runbook.md` | running the whole thing on a remote (SSH-only) server |
 
 ## Setup
 
@@ -67,7 +71,9 @@ git clone --depth 1 --filter=blob:none --sparse https://github.com/trishullab/Pu
 ( cd benchmarks/putnambench && git sparse-checkout set isabelle informal )
 .venv/bin/python harness/ib.py prepare --source minif2f --root benchmarks/minif2f/isabelle --split test
 .venv/bin/python harness/ib.py prepare --source putnambench --root benchmarks/putnambench/isabelle
+.venv/bin/python harness/ib.py prepare --source imo2026 --root problems/imo2026/isabelle   # ships with the repo
 .venv/bin/python harness/ib.py selftest
+.venv/bin/python scripts/bigstep_check.py problems/imo2026/isabelle/*.thy         # statements build? (P2 needs HOL-Analysis)
 ```
 
 ## Run
@@ -91,6 +97,9 @@ for i in 1 2; do nohup .venv/bin/python run_isabelle_solver.py --loop 0 > runs/w
 
 # results
 .venv/bin/python analyze.py --pair plain skeleton
+
+# the IMO 2026 tier: all six problems, both arms, 3 repeats each
+.venv/bin/python harness/ib.py queue-init --source imo2026 --arm plain skeleton --repeats 3
 ```
 
 Budgets default to `--max-steps 150 --timeout 3600` per attempt (upstream ran
@@ -108,6 +117,9 @@ final `.thy`:
    `consts`, ...);
 2. the theory header and the theorem statement are the frozen ones (comments
    stripped, whitespace normalized) and the theorem keeps its name;
+   multi-target files (IMO 2026: P1 states five theorems, P3 six) freeze
+   every definition block and every theorem statement, and all of them must
+   be proved -- the same rule as the Lean harnesses' `verify.py`;
 3. no helper definition reuses a name that occurs in the statement (Isabelle
    lets a local `definition prime` shadow the imported one);
 4. the whole theory builds (`isabelle build`, through the Pool Server's

@@ -1,0 +1,61 @@
+diff --git a/mcp_servers/lsp/config.py b/mcp_servers/lsp/config.py
+index 3892583..5b8425f 100644
+--- a/mcp_servers/lsp/config.py
++++ b/mcp_servers/lsp/config.py
+@@ -10,6 +10,13 @@ class Config:
+     # Where the running Isabelle Pool Server lives.
+     GYM_URL: str = env_str(_P, "GYM_URL", "http://localhost:8000")
+     DEFAULT_FIELD: str = env_str(_P, "FIELD", "HOL")
++    # File bindings: derive the session field (the logic image) from the file's
++    # own dotted imports instead of the server default. A file importing
++    # "HOL-Computational_Algebra.Computational_Algebra" then starts on that
++    # session's heap (fast) rather than loading its theories from source into
++    # the HOL image (minutes; isabelle_open used to time out). Needs the heap
++    # built on the server (`isabelle build -b <session>`). Opt-in.
++    FIELD_FROM_IMPORTS: bool = env_bool(_P, "FIELD_FROM_IMPORTS", False)
+     DEFAULT_TASK_GROUP: str = env_str(_P, "TASK_GROUP", "default")
+ 
+     # httpx timeout for the underlying client (must exceed load/build budgets).
+diff --git a/mcp_servers/lsp/pool.py b/mcp_servers/lsp/pool.py
+index 0a0fa5c..870b598 100644
+--- a/mcp_servers/lsp/pool.py
++++ b/mcp_servers/lsp/pool.py
+@@ -57,6 +57,25 @@ async def header_imports(client: PoolAsyncClient, text: str) -> List[str]:
+     return list(resp.get("imports") or [])
+ 
+ 
++# Distribution sessions in "contains the ones after it" order: HOL-Analysis
++# includes HOL-Computational_Algebra, HOL-Library and HOL-Combinatorics;
++# HOL-Number_Theory includes HOL-Computational_Algebra; and so on. A file that
++# mixes two incomparable sessions (HOL-Algebra + HOL-Analysis) gets the first
++# in this order and loads the rest from source, as before.
++_FIELD_ORDER = ("HOL-Probability", "HOL-Analysis", "HOL-Number_Theory", "HOL-Algebra",
++                "HOL-Computational_Algebra", "HOL-Combinatorics", "HOL-Library")
++
++
++def field_from_imports(imports: List[str]) -> Optional[str]:
++    """The session (logic image) a file's dotted imports imply; None when every
++    import is unqualified (Main, Complex_Main: the default field serves)."""
++    sessions = {i.split(".", 1)[0] for i in imports if "." in i}
++    for s in _FIELD_ORDER:
++        if s in sessions:
++            return s
++    return next(iter(sorted(sessions)), None)
++
++
+ def attempt_prefix(text: str, line: int) -> str:
+     """The file's text BEFORE 1-based `line` (multi_attempt prefix truncation)."""
+     lines = text.splitlines()
+@@ -133,8 +152,11 @@ class LspPool(GymClientMixin):
+         # no cheaper than a fresh session (docs/ISSUES.md Bug 21, audit MCP-4).
+         # The label is re-applied on every acquire server-side, so a reused
+         # session shows THIS file in the admin console, not its previous holder.
++        # Config.FIELD_FROM_IMPORTS: start on the heap the dotted imports name
++        # (None keeps the server default, as before this knob existed).
++        session_field = field_from_imports(imports or []) if Config.FIELD_FROM_IMPORTS else None
+         resp = await c.acquire_session(
+-            theories=imports, reuse_dirty=False,
++            theories=imports, field=session_field, reuse_dirty=False,
+             task_group=group, heap_session=heap_session, label=label or canon,
+         )
+         binding = FileBinding(

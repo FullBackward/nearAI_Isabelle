@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """ib.py - the benchmark side of the Isabelle harness (the `pb.py` of
-nearai/putnambench-deepseek, rewritten for Isabelle/HOL and for two sources).
+nearai/putnambench-deepseek, rewritten for Isabelle/HOL and for three sources).
 
 The agent never runs this. It is what the harness uses to turn a benchmark
 checkout into a manifest, to stage one problem into its own bench directory,
@@ -18,6 +18,14 @@ Sources
                   upstream, the `wsolution` variant inlines the answer into the
                   statement (the leaderboard setting) and `full` leaves the
                   `undefined` for the agent to replace.
+    imo2026       problems/imo2026/isabelle/ in this repository: the six IMO 2026
+                  problems, hand-translated from the Lean statements of
+                  AxiomMath/IMO2026 (the statements every published IMO 2026
+                  harness is scored on). These are MULTI-TARGET files: a file
+                  may define auxiliary constants and state several theorems,
+                  and ALL of them are the problem -- every definition and every
+                  statement is frozen and every `sorry` must go (same rule as
+                  the Lean harnesses' verify.py).
 
 Commands
     prepare --source S --root DIR [--split test|valid] [--informal JSON]
@@ -48,6 +56,9 @@ What `verify` checks (the Isabelle counterpart of upstream's verify.sh)
        normalized; the theorem keeps its name;
     5. no helper definition shadows a name the statement uses (Isabelle lets a
        new `definition prime` silently win over the imported `prime`);
+       multi-target files: every frozen definition block (definition,
+       inductive, type_synonym, ...) of the pristine file is still present
+       verbatim and every target theorem is stated exactly once, unchanged;
     6. the theory builds (`isabelle build`, via the Pool Server bigstep endpoint)
        -- the whole file, so helper lemmas are checked too.
     `full` variant: the `<name>_solution` definition must remain, with its
@@ -264,6 +275,72 @@ def sorryfy(text: str, name: str | None = None) -> str:
     return text[:a] + stmt + "\n  sorry\n\n" + text[end:]
 
 
+# Commands that start a new top-level block; a proof (or a definition block)
+# runs from its start to the next of these at the start of a line, or `end`.
+_TOPLEVEL_RE = re.compile(
+    r"^[ \t]*(?:theorem|lemma|corollary|proposition|lemmas|definition|abbreviation|fun|function|"
+    r"primrec|primcorec|inductive|inductive_set|coinductive|datatype|codatatype|record|"
+    r"type_synonym|typedef|lift_definition|locale|class|instantiation|interpretation|"
+    r"declare|named_theorems|text|txt|section|subsection|subsubsection|paragraph|chapter|"
+    r"context|notepad|end)\b", re.MULTILINE)
+
+_FROZEN_KINDS = ("definition", "abbreviation", "fun", "function", "primrec", "primcorec",
+                 "inductive", "inductive_set", "coinductive", "datatype", "codatatype",
+                 "record", "type_synonym", "typedef", "lift_definition", "locale")
+
+
+def _statements(text: str) -> list[tuple[str, int, int]]:
+    """(name, stmt_start, proof_start) for EVERY theorem-like statement outside
+    comments, in file order; proof_start is the index of the first proof
+    command (or of the next top-level block when there is none)."""
+    out = []
+    end = _theory_end(text)
+    for m in _STMT_RE.finditer(text):
+        if strip_comments(text[:m.start()]).count("(*") != 0:
+            continue
+        if m.start() >= end:
+            break
+        ps = find_proof_start(text, m.end())
+        nxt = _TOPLEVEL_RE.search(_pad_comments(text), m.end())
+        limit = nxt.start() if nxt else end
+        if ps is None or ps > limit:
+            ps = limit
+        out.append((m.group(2), m.start(), ps))
+    return out
+
+
+def sorryfy_all(text: str) -> str:
+    """Every theorem-like statement's proof replaced by `sorry`; definitions,
+    text blocks and everything else kept in place (multi-target files)."""
+    padded = _pad_comments(text)
+    end = _theory_end(text)
+    pieces, pos = [], 0
+    for _, a, ps in _statements(text):
+        nxt = _TOPLEVEL_RE.search(padded, ps)
+        proof_end = nxt.start() if nxt and nxt.start() <= end else end
+        pieces.append(text[pos:a] + text[a:ps].rstrip() + "\n  sorry\n\n")
+        pos = proof_end
+    pieces.append(text[pos:])
+    return "".join(pieces)
+
+
+def frozen_blocks(text: str) -> list[str]:
+    """Normalized text of every definition-like block (see _FROZEN_KINDS)
+    between `begin` and the final `end`, outside comments."""
+    padded = _pad_comments(text)
+    _, _, start = parse_header(text)
+    end = _theory_end(text)
+    blocks = []
+    ms = [m for m in _TOPLEVEL_RE.finditer(padded, start) if m.start() < end]
+    for i, m in enumerate(ms):
+        kw = m.group(0).strip()
+        if kw not in _FROZEN_KINDS:
+            continue
+        stop = ms[i + 1].start() if i + 1 < len(ms) else end
+        blocks.append(normalize(text[m.start():stop]))
+    return blocks
+
+
 # --------------------------------------------------------------------------- #
 # escape hatches and shadowing
 # --------------------------------------------------------------------------- #
@@ -375,7 +452,9 @@ def _entry_from_file(path: Path, source: str, split: str | None,
     base = path.stem
     if name != base:
         raise ValueError(f"{path.name}: theory name {name!r} != file stem")
-    pristine = sorryfy(text, None)          # proofs stripped, one `sorry`
+    multi = source in MULTI_TARGET_SOURCES
+    # proofs stripped: one `sorry` (single target) or one per statement
+    pristine = sorryfy_all(text) if multi else sorryfy(text, None)
     tname, a, b, _ = locate_statement(pristine, None)
     entry = {
         "name": base,
@@ -396,6 +475,14 @@ def _entry_from_file(path: Path, source: str, split: str | None,
         "pristine_path": str(path),
         "src_had_proof": bool(re.search(r"\bsorry\b", strip_comments(text[a:]))) is False,
     }
+    if multi:
+        stmts = _statements(pristine)
+        entry["targets"] = [n for n, _, _ in stmts]
+        entry["sigs"] = {n: normalize(pristine[sa:sb]) for n, sa, sb in stmts}
+        entry["frozen_blocks"] = frozen_blocks(pristine)
+        entry["pristine_defs"] = sorted(defined_names(strip_comments(pristine)) - set(entry["targets"]))
+        if len(set(entry["targets"])) != len(entry["targets"]):
+            raise ValueError(f"{path.name}: duplicate theorem names")
     if source == "minif2f":
         m = MINIF2F_CATEGORY.match(base)
         entry["category"] = m.group(1) if m else "other"
@@ -416,7 +503,20 @@ def _entry_from_file(path: Path, source: str, split: str | None,
             entry["reference_answer"] = answer
             _, wa, wb, _ = locate_statement(w, tname)
             entry["sig_wsolution"] = normalize(w[wa:wb])
+    elif source == "imo2026":
+        m = re.match(r"imo_(\d{4})_p(\d)", base)
+        entry["year"] = int(m.group(1)) if m else None
+        entry["category"] = f"p{m.group(2)}" if m else "other"
+        entry["tags"] = ["imo2026"]
+        # Strict parity with the Lean harnesses: AxiomMath's problem.lean carries only
+        # the per-definition docstrings, not the competition text, so the model gets
+        # no informal statement here either -- whatever `text` blocks the file has.
+        entry["informal_statement"] = None
     return entry
+
+
+# Sources whose files carry several frozen statements and definitions.
+MULTI_TARGET_SOURCES = {"imo2026"}
 
 
 def load_manifest() -> dict:
@@ -435,6 +535,10 @@ def cmd_prepare(args) -> int:
     if args.source == "minif2f":
         split = args.split or "test"
         files = sorted((root / split).glob("*.thy"))
+        informal = None
+    elif args.source == "imo2026":
+        split = None
+        files = sorted(root.glob("*.thy"))
         informal = None
     else:
         split = None
@@ -559,7 +663,7 @@ def cmd_select(args) -> int:
 def staged_text(entry: dict, variant: str) -> str:
     """The .thy the agent starts from."""
     text = Path(entry["pristine_path"]).read_text(encoding="utf-8")
-    text = sorryfy(text, None)
+    text = sorryfy_all(text) if entry.get("targets") else sorryfy(text, None)
     base = entry["name"]
     if entry["has_solution"]:
         if variant == "wsolution":
@@ -608,6 +712,8 @@ def textual_checks(text: str, entry: dict, variant: str) -> list[str]:
     except ValueError as ex:
         fails.append(f"cannot parse theory header: {ex}")
         return fails
+    if entry.get("targets"):
+        return fails + _multi_target_checks(text, clean, entry)
     try:
         tname, a, b, _ = locate_statement(text, entry["theorem_name"])
     except ValueError as ex:
@@ -638,6 +744,47 @@ def textual_checks(text: str, entry: dict, variant: str) -> list[str]:
     sh = shadowed(defs, text[a:b], keep)
     if sh:
         fails.append(f"helper definitions shadow names used in the statement: {sorted(sh)}")
+    return fails
+
+
+def _multi_target_checks(text: str, clean: str, entry: dict) -> list[str]:
+    """Multi-target files (imo2026): every target theorem stated exactly once
+    with its frozen signature, every frozen definition block still present
+    verbatim, and no NEW definition shadowing a name any of them uses."""
+    fails: list[str] = []
+    targets = entry["targets"]
+    stmts = {n: (a, b) for n, a, b in _statements(text)}
+    counts: dict[str, int] = {}
+    for m in _STMT_RE.finditer(clean):
+        counts[m.group(2)] = counts.get(m.group(2), 0) + 1
+    frozen_text = []
+    for t in targets:
+        if counts.get(t, 0) != 1:
+            fails.append(f"theorem {t} must be stated exactly once")
+            continue
+        a, b = stmts[t]
+        if normalize(text[a:b]) != entry["sigs"][t]:
+            fails.append(f"statement of {t} differs from the frozen one")
+        frozen_text.append(text[a:b])
+    norm_all = normalize(clean)
+    for blk in entry["frozen_blocks"]:
+        if blk not in norm_all:
+            fails.append("frozen definition block changed or removed: " + blk[:60])
+        frozen_text.append(blk)
+    # a frozen name must be introduced exactly once: the pristine block is
+    # still there (checked above), so a second `definition`/`fun`/`lemma` of
+    # the same name is a redefinition attempt
+    seen: dict[str, int] = {}
+    for m in DEFINES_RE.finditer(clean):
+        if m.group(2) not in ("where", "is", "and", "fixes", "assumes", "shows"):
+            seen[m.group(2)] = seen.get(m.group(2), 0) + 1
+    redefined = sorted(n for n in entry["pristine_defs"] if seen.get(n, 0) != 1)
+    if redefined:
+        fails.append(f"frozen names must be defined exactly once: {redefined}")
+    new_defs = defined_names(clean) - set(targets) - set(entry["pristine_defs"])
+    sh = shadowed(new_defs, "\n".join(frozen_text))
+    if sh:
+        fails.append(f"helper definitions shadow names used in the statements: {sorted(sh)}")
     return fails
 
 
@@ -891,6 +1038,33 @@ theorem synth_1:
 end
 '''
 
+SYNTH_MULTI = """theory imo_2026_p9
+  imports Main
+begin
+
+section \\<open>Synthetic multi-target file\\<close>
+
+text \\<open>Informal statement (synthetic): doubling.\\<close>
+
+type_synonym mode = nat
+
+definition dbl :: "nat \\<Rightarrow> nat" where
+  "dbl n = 2 * n"
+
+theorem t_one:
+  shows "dbl 1 = 2"
+  by (simp add: dbl_def)
+
+text \\<open>Second statement.\\<close>
+
+theorem t_two:
+  shows "dbl 2 = 4"
+  by (simp add: dbl_def)
+
+end
+"""
+
+
 
 def cmd_selftest(args) -> int:
     import tempfile
@@ -940,6 +1114,31 @@ def cmd_selftest(args) -> int:
         # the proof-start scanner respects strings
         s = 'theorem t:\n  shows "P by Q"\n  by simp\nend\n'
         check(statement_text(s).strip().endswith('"P by Q"'), "proof start ignores `by` inside a string")
+        # multi-target files (imo2026)
+        pm = Path(td) / "imo_2026_p9.thy"
+        pm.write_text(SYNTH_MULTI, encoding="utf-8")
+        em = _entry_from_file(pm, "imo2026", None, None)
+        check(em["targets"] == ["t_one", "t_two"] and em["category"] == "p9", f"multi targets {em['targets']}")
+        check(len(em["frozen_blocks"]) == 2 and em["pristine_defs"] == ["dbl", "mode"], f"frozen blocks {em['pristine_defs']}")
+        check(em["informal_statement"] is None, "imo2026 carries no informal statement (strict parity with Lean)")
+        st = staged_text(em, "wsolution")
+        check(st.count("sorry") == 2 and "by simp" not in st and "definition dbl" in st, "sorryfy_all strips both proofs")
+        good = st.replace("  sorry\n", "  by (simp add: dbl_def)\n")
+        check(textual_checks(good, em, "wsolution") == [], "multi: clean proofs pass")
+        good2 = good.replace("theorem t_two:", 'lemma helper: "dbl 1 = 2" by (simp add: dbl_def)\ntheorem t_two:')
+        check(textual_checks(good2, em, "wsolution") == [], "multi: helper lemma between targets is fine")
+        bad = good.replace("  by (simp add: dbl_def)\n", "  sorry\n", 1)
+        check(any("sorry" in x for x in textual_checks(bad, em, "wsolution")), "multi: one remaining sorry is caught")
+        bad = good.replace('"dbl n = 2 * n"', '"dbl n = n + n"')
+        check(any("frozen definition" in x for x in textual_checks(bad, em, "wsolution")), "multi: changed definition is caught")
+        bad = good.replace('shows "dbl 2 = 4"', 'shows "dbl 2 = 2 + 2"')
+        check(any("t_two differs" in x for x in textual_checks(bad, em, "wsolution")), "multi: changed statement is caught")
+        bad = good.replace("theorem t_two:", "theorem t_two: \"True\" by simp\ntheorem t_two:")
+        check(any("exactly once" in x for x in textual_checks(bad, em, "wsolution")), "multi: duplicated target is caught")
+        bad = re.sub(r"theorem t_one:.*?\n\n", "", good, flags=re.DOTALL)
+        check(any("t_one" in x for x in textual_checks(bad, em, "wsolution")), "multi: dropped target is caught")
+        bad = good.replace("theorem t_one:", 'definition mode :: nat where "mode = 0"\ntheorem t_one:')
+        check(any("exactly once" in x for x in textual_checks(bad, em, "wsolution")), "multi: redefining a frozen name is caught")
     print("selftest", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -952,12 +1151,12 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("prepare"); s.add_argument("--source", choices=["minif2f", "putnambench"], required=True)
+    s = sub.add_parser("prepare"); s.add_argument("--source", choices=["minif2f", "putnambench", "imo2026"], required=True)
     s.add_argument("--root", required=True); s.add_argument("--split", choices=["test", "valid"])
     s.add_argument("--informal"); s.set_defaults(fn=cmd_prepare)
 
     def filters(sp):
-        sp.add_argument("--source", choices=["minif2f", "putnambench"])
+        sp.add_argument("--source", choices=["minif2f", "putnambench", "imo2026"])
         sp.add_argument("--category"); sp.add_argument("--with-answer", action="store_true")
         sp.add_argument("--no-answer", action="store_true")
 

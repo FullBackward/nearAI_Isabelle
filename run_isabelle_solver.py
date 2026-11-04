@@ -515,7 +515,22 @@ so work the mathematics out before you start proving.
 """
     informal = e.get("informal_statement") or "(none -- the formal statement is the problem)"
     source = {"minif2f": "miniF2F (competition problems: AMC, AIME, IMO, MATH)",
-              "putnambench": "PutnamBench (William Lowell Putnam competition)"}[e["source"]]
+              "putnambench": "PutnamBench (William Lowell Putnam competition)",
+              "imo2026": "IMO 2026 (the six problems, formal statements after AxiomMath/IMO2026)"}[e["source"]]
+    targets = e.get("targets") or [e["theorem_name"]]
+    if len(targets) > 1:
+        task_block = f"""The file defines the objects of the problem and states {len(targets)} theorems
+({', '.join(targets)}), each with proof `sorry`. ALL of them are the problem:
+replace EVERY `sorry` with a real, complete Isar proof. The definitions and the
+theorem statements are frozen -- do not edit, rename, move or restate them.
+Helper lemmas anywhere between the frozen blocks are welcome (same rules: no
+sorry, nothing that shadows a name used in the frozen text). Prove the
+theorems in whichever order helps; an earlier target may be used in a later
+proof once it is proved."""
+    else:
+        task_block = """The file contains a single theorem whose proof is `sorry`. Replace the `sorry`
+with a real, complete Isar proof. Helper lemmas ABOVE the theorem are welcome
+(same rules: no sorry, nothing that shadows a name used in the statement)."""
     fill_note = ""
     if at.arm.auto_fill:
         fill_note = """
@@ -542,9 +557,7 @@ Informal statement:
 
 {informal}
 
-The file contains a single theorem whose proof is `sorry`. Replace the `sorry`
-with a real, complete Isar proof. Helper lemmas ABOVE the theorem are welcome
-(same rules: no sorry, nothing that shadows a name used in the statement).
+{task_block}
 {answer_block}
 # Your tools
 
@@ -723,7 +736,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
                                    agent_name=f"isa-{arm_name}-{problem}-rep{rep}")
 
             user_input = (
-                f"Solve the problem '{problem}' ({entry['source']}): replace the `sorry` in "
+                f"Solve the problem '{problem}' ({entry['source']}): replace every `sorry` in "
                 f"{at.thy.name} with a complete Isar proof, then call completed(). The run "
                 f"ends only when completed() reports PASS, or -- in the rare case where the "
                 f"formalized goal is false -- when you have proven that and called disproved()."

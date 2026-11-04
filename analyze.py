@@ -111,7 +111,7 @@ def paired(rows: list[dict], a: str, b: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results", default=str(Path(__file__).resolve().parent / "runs" / "results.jsonl"))
-    ap.add_argument("--source", choices=["minif2f", "putnambench"])
+    ap.add_argument("--source", choices=["minif2f", "putnambench", "imo2026"])
     ap.add_argument("--arms", nargs="*")
     ap.add_argument("--pair", nargs=2, metavar=("ARM_A", "ARM_B"))
     ap.add_argument("--errors", action="store_true", help="list attempts with a setup error")

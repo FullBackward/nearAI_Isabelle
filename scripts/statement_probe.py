@@ -144,7 +144,7 @@ async def main_async(args) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source", choices=["minif2f", "putnambench"])
+    p.add_argument("--source", choices=["minif2f", "putnambench", "imo2026"])
     p.add_argument("--split", choices=["test", "valid"], help="minif2f split (manifest field)")
     p.add_argument("--category"); p.add_argument("--with-answer", action="store_true"); p.add_argument("--no-answer", action="store_true")
     p.add_argument("--subset"); p.add_argument("--limit", type=int, default=0)

@@ -129,3 +129,16 @@ def test_arm_tool_sets_are_disjoint_on_the_treatment():
     assert "isabelle_sledgehammer" not in ARMS["skeleton"].mcp_tools
     assert "isabelle_fill_sorries" in ARMS["skeleton"].mcp_tools
     assert ARMS["skeleton"].auto_fill and not ARMS["plain"].auto_fill
+
+
+def test_system_prompt_for_multi_target_entry(tmp_path):
+    """IMO 2026 files state several theorems: the prompt must say all of them
+    are the problem and name them; single-target entries keep the old text."""
+    at, b, reg = make(tmp_path)
+    assert "single theorem" in rs._system_prompt(at)
+    entry = dict(ENTRY, source="imo2026", targets=["t1", "t_two", "t_three"],
+                 sigs={}, frozen_blocks=[], pristine_defs=[], tags=["imo2026"])
+    at2 = rs._Attempt(entry, "wsolution", ARMS["skeleton"], tmp_path, b, True)
+    txt = rs._system_prompt(at2)
+    assert "3 theorems" in txt and "t_three" in txt and "EVERY `sorry`" in txt
+    assert "IMO 2026" in txt
