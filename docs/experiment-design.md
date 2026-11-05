@@ -30,12 +30,13 @@ Differences forced by Isabelle:
 
 ## Arms
 
-| | plain | skeleton | fill_optional |
-|---|---|---|---|
-| per-goal `isabelle_sledgehammer` | yes | **no** | yes |
-| `isabelle_fill_sorries` / status / cancel | no | yes | yes |
-| `write_file` auto-fills a clean file with sorries and writes the patch back | no | **yes** | no |
-| prompt strategy | sledgehammer stuck goals | skeleton first, iterate on survivors | neutral |
+| | plain | skeleton | skeleton_forced | fill_optional |
+|---|---|---|---|---|
+| per-goal `isabelle_sledgehammer` | yes | **no** | **no** | yes |
+| `isabelle_fill_sorries` / status / cancel | no | yes | yes | yes |
+| `write_file` auto-fills a clean file with sorries and writes the patch back | no | **yes** | **yes** | no |
+| leaf rule: the model never writes a closing method | no | no | **yes** | no |
+| prompt strategy | sledgehammer stuck goals | skeleton first, iterate on survivors | skeleton, `sorry` every leaf | neutral |
 
 Everything else (model, temperature, system prompt skeleton, query tools,
 verifier, budgets, solver rule) is identical. The arms are interleaved in the
@@ -53,6 +54,27 @@ testable: with `isabelle_sledgehammer` available, a model that ignores the
 instructions reverts to the plain workflow and the arm measures prompt
 compliance, not the feature. The `fill_optional` arm exists to measure that
 voluntary uptake separately, if wanted.
+
+**Why `skeleton_forced` exists (added 2026-11-05).** Hiding the per-goal tool
+is not enough: the first solved Q1 plain run wrote 338 closers (`simp`,
+`rule`, `auto`, `linarith`, `blast`) by hand, tested in scratch sessions, and
+never called sledgehammer. In `skeleton` the same model would leave no
+`sorry`, the filler would never run, and the arm would measure nothing. The
+forced arm makes the treatment mechanical with the *leaf rule*
+(`harness/leaves.py`, textual like the solver rule): `write_file` accepts a
+closing method only if the filler produced it for that statement under the
+same chain of enclosing goals (the key is statement text plus the `proof`
+goals open above it, so `show ?thesis by simp` proved in one block does not
+transfer to another); everything else must be `sorry`. The model keeps the
+structure, the intermediate facts and the `using` facts; sledgehammer proves
+every leaf at least once. Goal-shaping initial methods (`proof -`, `rule`,
+`intro`, `cases`, `induction`, ...) stay allowed, `apply` scripts and
+`proof (auto)` do not. Owner's choice over a "filler-first" variant that
+would have allowed hand closers where the filler had already failed. Side
+effect: this is the mechanical goal binding of audit F8 on the skeleton side,
+so the arm also measures how much binding removes the metis-transplant
+failure. Cost: one sledgehammer run per leaf per fill round (30 s budget
+each, 600 s per job), so a 300-leaf proof needs several rounds.
 
 ## Benchmark (recommendation)
 
@@ -198,6 +220,22 @@ its first `completed()`; the file it submitted (854 lines, 3 metis calls, no
   outage (`VERIFIER UNAVAILABLE`, not counted as a failed completion; the
   results line says `verifier unavailable`), and `IB_BUILD_TIMEOUT` defaults
   to 1800 s.
+- **Q1 plain, second run (2026-11-05 06:30-07:41 UTC): SOLVED.** 196 model
+  calls, 71 min wall clock (24 min in tools), 2 writes, 1 `completed()`, build
+  9 s; 249 `isabelle_query` + 100 `isabelle_run_code` and **zero sledgehammer
+  calls**: the model composed the whole 1209-line proof in scratch sessions
+  and wrote it once (one fix round for 22 ordering errors). No metis/smt
+  anywhere. Verified independently: identical bytes rebuild on a second Pool
+  Server. 25.4 M prompt tokens, 99.6 % cached. Same model, same statement as
+  the failed first run -- one transplanted metis made the difference, which
+  says as much about variance as about the arms. It also showed the plain
+  arm's treatment is optional, hence `skeleton_forced`.
+- **Harness: a failed (not timed-out) check was reported as "still running
+  line False".** The LSP MCP computes `stuck_line` as `timed_out and commands
+  and next(...)`, so a plain failure returns `False`; `isinstance(False,
+  int)` is true in Python. One occurrence (the first write of the solved run);
+  the model acted on the 22 real errors listed below it. Fixed: only a
+  positive integer names a running line; regression test added.
 - **IPS: a timed-out bigstep build leaves the ML process running.** The
   server kills the `isabelle build` wrapper at its limit but then waits for
   the pipes to close, which the orphaned `poly` keeps open; the request does

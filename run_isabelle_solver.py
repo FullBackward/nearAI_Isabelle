@@ -48,7 +48,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import agentlib
-from harness.arms import ARMS, SOLVER_SOURCE_TOOLS, Arm
+from harness import leaves
+from harness.arms import ARMS, FILL_TOOLS, SOLVER_SOURCE_TOOLS, Arm
 from harness.mcp_bridge import MCPBridge
 
 HERE = Path(__file__).resolve().parent
@@ -166,6 +167,13 @@ class _Attempt:
         self.bridge = bridge
         self.enforce = enforce_solver_rule
         self.sanctioned: set[str] = set()
+        # skeleton_forced (leaf rule): the leaves the filler wrote, keyed by
+        # statement and enclosing goals (harness/leaves.py), seeded with the
+        # staged file's own proofs; write_file accepts no other method text.
+        self.filler_keys: set[leaves.Key] = (
+            leaves.leaf_keys(self.thy.read_text(encoding="utf-8"))
+            if arm.filler_only and self.thy.exists() else set())
+        self.leaf_rejections = 0
         # outcome (set only by the finishing tools)
         self.kind: str | None = None          # None | completed | disproved
         self.disproof_file = ""
@@ -191,6 +199,17 @@ class _Attempt:
 
     def count(self, name: str) -> None:
         self.tool_calls[name] = self.tool_calls.get(name, 0) + 1
+
+    def note_filler_text(self, raw: str) -> None:
+        """Leaf rule: every leaf in a text the filler returned is allowed from
+        now on (under its statement and enclosing goals)."""
+        try:
+            d = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        pt = d.get("patched_text") if isinstance(d, dict) else None
+        if isinstance(pt, str) and pt.strip():
+            self.filler_keys |= leaves.leaf_keys(pt)
 
     def mcp(self, name: str, args: dict, timeout: float = TOOL_TIMEOUT_S) -> str:
         """One MCP call with the session housekeeping the model cannot do.
@@ -229,6 +248,8 @@ class _Attempt:
             "result": out, "elapsed_s": round(time.time() - t0, 3), "retries": attempt})
         if name in SOLVER_SOURCE_TOOLS:
             self.sanctioned |= sanctioned_from_output(out)
+        if name in FILL_TOOLS and self.arm.filler_only:
+            self.note_filler_text(out)
         if name == "isabelle_sledgehammer":
             self.sledgehammer_calls += 1
             if '"found": true' in out or '"success": true' in out:
@@ -251,8 +272,14 @@ class _Attempt:
             return None
         if d.get("success"):
             return None
-        if isinstance(d.get("stuck_line"), int):
-            return d["stuck_line"]
+        # The MCP computes the field as `timed_out and commands and next(...)`,
+        # so a check that merely FAILED (no timeout) hands back False, and
+        # bool is an int in Python: the Q1 plain run (2026-11-05) told the
+        # model "still running line False" after a 5 s check with 22 errors.
+        # Only a positive integer names a running line.
+        sl = d.get("stuck_line")
+        if isinstance(sl, int) and not isinstance(sl, bool) and sl > 0:
+            return sl
         m = re.search(r"still running at line (\d+)", str(d.get("error") or ""))
         return int(m.group(1)) if m else None
 
@@ -402,6 +429,18 @@ def _register_file_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
                         ". Only method calls returned by the sledgehammer/fill tools in this "
                         "run may be pasted (verbatim). Replace them with simple closers, "
                         "`sorry` (then let the filler try), or a sledgehammer result.")
+        if at.arm.filler_only:
+            # The leaf rule (harness/leaves.py): the model never closes a step
+            # itself. Checked before the file changes, like the solver rule.
+            bad = leaves.check(content, at.filler_keys)
+            if bad:
+                at.rejected_writes += 1
+                at.leaf_rejections += 1
+                return ("REJECTED (file unchanged): the LEAF RULE of this arm -- you never write a "
+                        "closing proof method yourself; every leaf is `sorry` until the filler proves "
+                        "it, and filler-proved lines are kept verbatim under the same statement. "
+                        f"{len(bad)} offending line(s):\n" + leaves.summarize(bad) +
+                        "\nPut `sorry` on those steps (with the `using` facts they need) and write again.")
         at.thy.write_text(content, encoding="utf-8")
         at.writes += 1
         diag, errors, has_sorry = at.diagnostics()
@@ -417,7 +456,11 @@ def _register_file_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
         "result" + (", and -- when the file parses cleanly but still contains `sorry` -- the "
                     "server runs sledgehammer on every `sorry` and the proved ones are written "
                     "back into the file automatically (the result tells you what remains)."
-                    if at.arm.auto_fill else "."),
+                    if at.arm.auto_fill else ".")
+        + (" LEAF RULE: a write carrying any closing method the filler did not produce for that "
+           "statement (`by ...`, `.`, `..`, `apply`, `qed <method>`, `proof (auto)`) is REJECTED "
+           "and the file stays unchanged; every leaf is `sorry` or a filler-written line kept verbatim."
+           if at.arm.filler_only else ""),
         {"type": "object",
          "properties": {"content": {"type": "string", "description": "the complete new file content"}},
          "required": ["content"]},
@@ -728,6 +771,27 @@ file; the write_file result tells you what it proved and which lines are still
 `sorry`. So: state your proof as a skeleton of small, true `have` steps ending
 in `sorry`, write it, and iterate on the survivors.
 """
+    if at.arm.filler_only:
+        rule_block = """# LEAF RULE (enforced; it subsumes the solver rule)
+
+You never write a closing proof method yourself. write_file REJECTS a file in
+which any `by ...`, `.`, `..`, `apply`, `qed <method>` or goal-closing
+`proof <method>` was not produced by the filler for that very statement under
+the same enclosing goals. Yours: the structure (`proof -`, `proof (rule ...)`,
+`(intro ...)`, `(cases ...)`, `(induction ...)`, `fix`/`assume`/`obtain`/
+`have`/`show`/`qed`), the intermediate facts, `using`/`unfolding` facts, and
+`sorry` on every leaf. The filler's lines come back through write_file; keep
+them exactly as read_file shows them.
+"""
+    else:
+        rule_block = """# SOLVER RULE (enforced)
+
+Never write `metis`, `smt`, `meson` or `moura` calls yourself. write_file
+REJECTS a file containing such a call unless that exact call came out of a
+sledgehammer / fill result in this run -- paste those verbatim. Everything
+else (simp, auto, force, blast, linarith, arith, algebra, presburger, argo,
+induction, cases, unfolding, rule applications, structured Isar) is yours.
+"""
     return f"""\
 You are an autonomous Isabelle/HOL proof engineer working on {source}.
 
@@ -760,14 +824,7 @@ Informal statement:
 - disproved() / write_disproof(): only for a formalization that is actually
   false -- see below. Rare.
 
-# SOLVER RULE (enforced)
-
-Never write `metis`, `smt`, `meson` or `moura` calls yourself. write_file
-REJECTS a file containing such a call unless that exact call came out of a
-sledgehammer / fill result in this run -- paste those verbatim. Everything
-else (simp, auto, force, blast, linarith, arith, algebra, presburger, argo,
-induction, cases, unfolding, rule applications, structured Isar) is yours.
-
+{rule_block}
 # HOW THIS RUN ENDS
 
 There are exactly TWO ways to finish, and you must reach one of them:
@@ -1144,7 +1201,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
     if at is not None:
         print(f"finishing tool : {at.kind or '(none called)'}")
         print(f"nudges         : {at.nudges}   failed completions: {at.failed_completions}")
-        print(f"writes         : {at.writes} (rejected {at.rejected_writes})  fills: {at.fills} "
+        print(f"writes         : {at.writes} (rejected {at.rejected_writes}, leaf rule {at.leaf_rejections})  fills: {at.fills} "
               f"({at.fill_sorries_proved}/{at.fill_sorries_total} sorries)  sledgehammer: "
               f"{at.sledgehammer_found}/{at.sledgehammer_calls}  busy retries: {at.busy_retries} "
               f"(releases {at.releases})")
@@ -1174,6 +1231,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
             "finishing_tool": at.kind, "nudges": at.nudges, "failed_completions": at.failed_completions,
             "verifier_unavailable": at.verifier_unavailable,
             "tool_calls": at.tool_calls, "writes": at.writes, "rejected_writes": at.rejected_writes,
+            "leaf_rejections": at.leaf_rejections,
             "fills": at.fills, "auto_fills": at.auto_fills,
             "fill_sorries_total": at.fill_sorries_total, "fill_sorries_proved": at.fill_sorries_proved,
             "sledgehammer_calls": at.sledgehammer_calls, "sledgehammer_found": at.sledgehammer_found,

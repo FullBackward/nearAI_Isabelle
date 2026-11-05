@@ -282,6 +282,26 @@ def test_timed_out_check_is_an_error_and_blocks_the_build(tmp_path, monkeypatch)
     assert at.failed_completions == 1 and at.kind is None
 
 
+def test_failed_check_with_false_stuck_line_is_not_a_timeout(tmp_path, monkeypatch):
+    """Q1 plain run 2026-11-05: the LSP MCP computes stuck_line as
+    `timed_out and commands and next(...)`, so a check that failed on plain
+    errors reports stuck_line=False -- and bool is an int. The harness told
+    the model "CHECK TIMED OUT ... line False" after a 5 s check. A failed
+    check lists its errors and nothing else; completed() still builds."""
+    at, b, reg = make(tmp_path)
+    rs._register_finishing_tools(reg, at)
+    b.sync = {"synced": True, "success": False, "error": None, "stuck_line": False}
+    b.diag = {"messages": [{"line": 3, "kind": "by", "severity": "error", "text": "Failed to finish proof"}],
+              "success": False, "proof_open": False, "used_sorry": False}
+    out = reg.invoke("write_file", json.dumps({"content": THY.replace("sorry", "by simp")}))
+    assert "CHECK TIMED OUT" not in out and "line False" not in out and "Failed to finish proof" in out
+    assert at.stuck_line() is None
+    built = []
+    monkeypatch.setattr(rs.ib, "build_check", lambda text, entry, **kw: built.append(1) or (False, "FAIL: build"))
+    out = reg.invoke("completed", "{}")
+    assert built and "still running" not in out
+
+
 def test_verifier_outage_is_not_a_failed_completion(tmp_path, monkeypatch):
     at, b, reg = make(tmp_path)
     rs._register_finishing_tools(reg, at)
@@ -369,3 +389,82 @@ def test_harness_mcp_calls_are_in_the_transcript(tmp_path):
     assert ("mcp", "isabelle_sync") in kinds and ("mcp", "isabelle_diagnostic_messages") in kinds
     rec = next(r for r in recs if r["name"] == "isabelle_diagnostic_messages")
     assert json.loads(rec["arguments"]) == {"severity": "error"} and "messages" in rec["result"]
+
+
+# ---- skeleton_forced: the leaf rule ------------------------------------- #
+
+PROVED = THY.replace("sorry", "by simp")
+
+
+def test_leaf_rule_rejects_hand_written_closers(tmp_path):
+    """skeleton_forced: the model never closes a step itself. A write with a
+    hand-written `by` is refused before the file changes; a sorry skeleton is
+    accepted and goes to the filler."""
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    out = reg.invoke("write_file", json.dumps({"content": PROVED}))
+    assert out.startswith("REJECTED") and "LEAF RULE" in out and "line 5" in out and "by simp" in out
+    assert at.thy.read_text() == THY and at.leaf_rejections == 1 and at.rejected_writes == 1
+    assert not any(c[0] == "isabelle_sync" for c in b.calls)          # refused before any session call
+    # apply scripts and goal-closing initial methods are refused too
+    for bad in ('theorem t1: shows "True"\n  apply simp\n  done\n',
+                'theorem t1: shows "True"\nproof (auto)\nqed\n',
+                'theorem t1: shows "True"\nproof -\n  show ?thesis sorry\nqed simp\n'):
+        text = THY.replace('theorem t1: shows "True"\n  sorry\n', bad)
+        assert reg.invoke("write_file", json.dumps({"content": text})).startswith("REJECTED"), bad
+    # a skeleton is fine and triggers the auto-fill
+    out = reg.invoke("write_file", json.dumps({"content": THY}))
+    assert out.startswith("wrote") and "fill_sorries" in out
+    assert [c[0] for c in b.calls][-3:] == ["isabelle_sync", "isabelle_diagnostic_messages", "isabelle_fill_sorries"]
+
+
+def test_leaf_rule_accepts_filler_lines_verbatim_and_bound_to_their_statement(tmp_path):
+    """What the filler wrote back may be kept, verbatim, under the same
+    statement; the same method under another statement is a new leaf."""
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    b.fill = {"filled": 1, "n": 1, "continuing": False,
+              "results": [{"line": 5, "outcome": "proved", "method": "by simp"}],
+              "patched_text": PROVED}
+    out = reg.invoke("write_file", json.dumps({"content": THY}))
+    assert "1/1 sorry(s) proved" in out and at.thy.read_text() == PROVED
+    # the model writes the filler's text back unchanged (plus a new sorry lemma): accepted
+    more = PROVED.replace("\nend", '\nlemma t2: shows "True \\<and> True"\n  sorry\n\nend')
+    assert reg.invoke("write_file", json.dumps({"content": more})).startswith("wrote")
+    # the same `by simp` pasted under the new statement is NOT the filler's leaf
+    pasted = more.replace('shows "True \\<and> True"\n  sorry', 'shows "True \\<and> True"\n  by simp')
+    out = reg.invoke("write_file", json.dumps({"content": pasted}))
+    assert out.startswith("REJECTED") and "line 8" in out
+    # a reworded statement over a filler leaf is a new leaf as well
+    reworded = more.replace('theorem t1: shows "True"\n  by simp', 'theorem t1: shows "True \\<or> False"\n  by simp')
+    assert reg.invoke("write_file", json.dumps({"content": reworded})).startswith("REJECTED")
+    # whitespace changes do not matter
+    spaced = more.replace('theorem t1: shows "True"\n  by simp', 'theorem t1:   shows "True"\n      by   simp')
+    assert reg.invoke("write_file", json.dumps({"content": spaced})).startswith("wrote")
+
+
+def test_leaf_rule_seeds_from_the_staged_file_and_explicit_fill_results(tmp_path):
+    """Proofs already in the statement file are allowed as they are, and a
+    patched text from an explicit isabelle_fill_sorries call counts too."""
+    given = THY.replace('theorem t1: shows "True"\n  sorry', 'lemma pre: "1 = (1::nat)"\n  by simp\n\ntheorem t1: shows "True"\n  sorry')
+    (tmp_path / "t1.thy").write_text(given)
+    b = FakeBridge()
+    at = rs._Attempt(ENTRY, "wsolution", ARMS["skeleton_forced"], tmp_path, b, True)
+    reg = agentlib.ToolRegistry()
+    rs._register_file_tools(reg, at)
+    assert reg.invoke("write_file", json.dumps({"content": given})).startswith("wrote")
+    # an explicit fill result registers its leaves even though the model, not
+    # the harness, writes the patched text back
+    at.note_filler_text(json.dumps({"patched_text": given.replace("  sorry", "  by blast")}))
+    assert reg.invoke("write_file", json.dumps({"content": given.replace("  sorry", "  by blast")})).startswith("wrote")
+    assert at.leaf_rejections == 0
+
+
+def test_leaf_rule_is_off_in_the_other_arms(tmp_path):
+    for arm in ("plain", "skeleton", "fill_optional"):
+        at, b, reg = make(tmp_path, arm=arm)
+        assert reg.invoke("write_file", json.dumps({"content": PROVED})).startswith("wrote"), arm
+        assert at.leaf_rejections == 0
+
+
+def test_leaves_selftest():
+    from harness import leaves
+    leaves.selftest()

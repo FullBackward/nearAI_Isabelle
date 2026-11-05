@@ -32,7 +32,11 @@ docs/experiment-design.md the design and open decisions.
   result to the goal it was found for (owner decision, 2026-11-05: metis transplants are a finding,
   see docs/experiment-design.md). The solver rule lives in `extract_solver_calls` /
   `sanctioned_from_output`; the skeleton arm's automatic fill in `_auto_fill`.
-- `harness/arms.py` -- the only place arms differ: `mcp_tools`, `auto_fill`, `strategy`.
+- `harness/arms.py` -- the only place arms differ: `mcp_tools`, `auto_fill`, `strategy`,
+  `filler_only`. The `skeleton_forced` arm adds the leaf rule (`harness/leaves.py`): the model
+  never writes a closing method; `write_file` accepts only `sorry` or a leaf the filler wrote,
+  verbatim, keyed by statement and the chain of enclosing goals (`_Attempt.filler_keys`, seeded
+  from the staged file, extended from every fill result). `leaves.py selftest` after any change.
 - `harness/ib.py` -- manifest (`prepare`), staging (proof stripping via `sorryfy` /
   `sorryfy_all`, PutnamBench answer inlining via `inline_solution`), the verifier
   (`textual_checks` + `build_check`; `_multi_target_checks` for files in `MULTI_TARGET_SOURCES`

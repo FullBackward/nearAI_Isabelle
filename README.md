@@ -21,7 +21,16 @@ Two arms, identical in everything but how sledgehammer is reached
 |---|---|---|
 | `plain` | `isabelle_sledgehammer(line, subgoal)` on one open goal | no |
 | `skeleton` | `fill_sorries` on every `sorry` in the file; no per-goal tool | yes: every `write_file` that parses cleanly and still has `sorry`s is filled and written back |
+| `skeleton_forced` | as `skeleton`, plus the **leaf rule** (`harness/leaves.py`): the model never writes a closing method; every leaf is `sorry` until the filler proves it, and only filler-written lines (verbatim, same statement, same enclosing goals) are accepted | yes |
 | `fill_optional` (extra) | both | no |
+
+`skeleton_forced` exists because the first Q1 plain run (2026-11-05) proved the
+problem with 338 hand-written closers and zero sledgehammer calls: nothing in
+`skeleton` stops a model from writing `by simp` everywhere and never leaving a
+`sorry` for the filler. In the forced arm `write_file` rejects any `by`, `.`,
+`..`, `apply`, `qed <method>` or goal-closing `proof <method>` the filler did
+not produce for that statement, so the treatment cannot be skipped. The
+results row carries `leaf_rejections`.
 
 In every arm the harness **enforces** the solver rule: `write_file` rejects a
 `metis` / `smt` / `meson` / `moura` call that did not come out of a

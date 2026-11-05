@@ -18,6 +18,16 @@ strategy section of the system prompt.
     fill_optional  both tool sets, nothing automatic, neutral prompt --
                    measures whether the agent reaches for fill_sorries on its
                    own. (Optional third arm.)
+    skeleton_forced
+                   the skeleton arm plus the LEAF RULE (harness/leaves.py):
+                   the agent never writes a closing method itself. Every leaf
+                   is `sorry` until the filler proves it, and the only method
+                   text write_file accepts is what the filler wrote back, kept
+                   verbatim under the same statement and enclosing goals. The
+                   Q1 plain run (2026-11-05) proved the problem with 338 hand
+                   closers and zero sledgehammer calls; the plain skeleton arm
+                   would let the same thing happen (no `sorry`, no fill). This
+                   arm is where the treatment cannot be skipped.
 
 In every arm the SOLVER RULE is enforced by the harness, not just worded:
 proof text invoking an ATP-reconstruction method (metis / smt / meson / moura)
@@ -59,6 +69,7 @@ class Arm:
     auto_fill: bool
     strategy: str
     tool_notes: str = ""
+    filler_only: bool = False     # the leaf rule (skeleton_forced)
 
 
 _COMMON_STRATEGY = """\
@@ -117,6 +128,42 @@ _OPTIONAL_STRATEGY = _COMMON_STRATEGY + """\
    with write_file). Use whichever fits.
 """
 
+_FORCED_STRATEGY = """\
+1. Read the file. Restate the goal to yourself in ordinary mathematics.
+2. Get the mathematical idea straight before writing Isar -- these are
+   competition problems: formalizing is routine once the argument is right and
+   hopeless when it is not. A sketch you could say aloud in a minute, then test
+   its first step against Isabelle.
+3. Write STRUCTURED Isar (`proof -` ... `have ... sorry` ... `show ?thesis
+   sorry` ... `qed`), one small, checkable step per `have`, with the facts a
+   step needs given by `using` / `unfolding` before its `sorry`.
+4. THE LEAF RULE (write_file enforces it): you never write a closing proof
+   method yourself. No `by ...`, no `.` / `..`, no `apply`, no `qed auto`, no
+   `proof (auto)` / `proof simp`. The only methods you write are the
+   goal-shaping ones: `proof -`, `proof (rule ...)`, `(intro ...)`,
+   `(cases ...)`, `(induction ...)`. Every other leaf ends in `sorry`.
+   Each write_file whose text parses with no errors and still contains
+   `sorry` is AUTOMATICALLY handed to the server, which runs sledgehammer on
+   every `sorry` at once and writes the proved ones back into your file (you
+   get the new file text, the per-sorry outcomes and the lines still `sorry`).
+   Keep filler-proved lines EXACTLY as read_file shows them, under the same
+   statement in the same block. A write carrying any other method is REJECTED
+   and the file is unchanged.
+5. Find lemmas with isabelle_query("find_theorems ...") and
+   isabelle_query("thm name"); inspect a goal state with isabelle_goal(line).
+   isabelle_multi_attempt(line, candidates) and isabelle_run_code let you test
+   a step in scratch -- in the FILE the step still ends in `sorry`; give the
+   filler the facts that worked, via `using`.
+6. After EVERY write_file read the diagnostics it returns and fix every error
+   it reports (line, kind, message). Keep writes small and frequent.
+7. For each `sorry` the filler could not prove, refine the skeleton: split the
+   step into smaller `have`s, add the facts it needs with `using`, state the
+   intermediate equalities explicitly -- and write the file again.
+   isabelle_fill_sorries(timeout_s=...) re-runs the filler with a bigger
+   per-sorry budget when a leaf looks plausible but timed out.
+8. When the diagnostics are clean and no `sorry` remains, call completed().
+"""
+
 ARMS: dict[str, Arm] = {
     "plain": Arm(
         name="plain",
@@ -131,6 +178,15 @@ ARMS: dict[str, Arm] = {
         mcp_tools=COMMON_TOOLS + FILL_TOOLS,
         auto_fill=True,
         strategy=_SKELETON_STRATEGY,
+    ),
+    "skeleton_forced": Arm(
+        name="skeleton_forced",
+        description="LSP MCP, skeleton-first with the LEAF RULE: the model never writes a closing "
+                    "method; every leaf is `sorry` until fill_sorries proves it",
+        mcp_tools=COMMON_TOOLS + FILL_TOOLS,
+        auto_fill=True,
+        strategy=_FORCED_STRATEGY,
+        filler_only=True,
     ),
     "fill_optional": Arm(
         name="fill_optional",
