@@ -17,8 +17,8 @@ refuses to let the model stop). What changed:
   * the SOLVER RULE is enforced: write_file rejects proof text with a
     metis/smt/meson/moura call that did not come out of a sledgehammer or
     fill_sorries result in this attempt.
-  * budgets are finite by default (this is a comparison, not a leaderboard
-    push): --max-steps 150, --timeout 3600 s. Raise them as you like.
+  * no step budget, as upstream (the harness owns the stopping rule); a wall-clock
+    cap only: --timeout 14400 s (4 h). --max-steps N caps turns if you want it.
 
 Usage:
     python3 run_isabelle_solver.py --problem mathd_algebra_276 --arm skeleton
@@ -175,14 +175,40 @@ class _Attempt:
         self.sledgehammer_calls = 0
         self.sledgehammer_found = 0
         self.tool_time_s = 0.0
+        self.busy_retries = 0       # server refusals (pool full / memory) retried by the harness
+        self.releases = 0           # isabelle_release_idle calls the harness made for the model
 
     def count(self, name: str) -> None:
         self.tool_calls[name] = self.tool_calls.get(name, 0) + 1
 
     def mcp(self, name: str, args: dict, timeout: float = TOOL_TIMEOUT_S) -> str:
+        """One MCP call with the session housekeeping the model cannot do.
+        The MCP's memory/lifecycle tools (isabelle_release_idle, close, list,
+        memory_status) are hidden from the model on purpose, but the server's
+        refusals name them in their advice -- and a model that cannot call
+        them wastes turns reasoning about it (seen on the first P1 run). So a
+        capacity refusal (pool_full, memory_pressure, scratch exhausted, ...)
+        is handled here: free the idle scratch sessions this MCP holds, wait
+        the server's retry_after, call again, up to _BUSY_MAX_TRIES; and
+        whatever comes back has the hidden tool names replaced by what the
+        model should actually do (retry)."""
         t0 = time.time()
-        out = self.bridge.call(name, {"file_path": str(self.thy), **args} if _takes_file_path(name) else args,
-                               timeout=timeout)
+        full_args = {"file_path": str(self.thy), **args} if _takes_file_path(name) else args
+        for attempt in range(_BUSY_MAX_TRIES):
+            out = self.bridge.call(name, full_args, timeout=timeout)
+            kind, retry = _busy_error(out)
+            if kind is None or name == "isabelle_release_idle" or attempt == _BUSY_MAX_TRIES - 1:
+                break
+            self.busy_retries += 1
+            try:
+                rel = self.bridge.call("isabelle_release_idle", {"max_idle_s": 0}, timeout=60)
+                self.releases += 1
+                print(f"[harness] {name}: {kind}; released idle sessions ({rel[:100]}); retry in {retry:.0f}s",
+                      flush=True)
+            except Exception as e:                       # noqa: BLE001
+                print(f"[harness] {name}: {kind}; release_idle failed: {e}; retry in {retry:.0f}s", flush=True)
+            time.sleep(min(max(retry, 2.0), 30.0))
+        out = _strip_hidden_advice(out)
         self.tool_time_s += time.time() - t0
         if name in SOLVER_SOURCE_TOOLS:
             self.sanctioned |= sanctioned_from_output(out)
@@ -215,6 +241,58 @@ class _Attempt:
         return text, bool(msgs), has_sorry
 
 
+# Server-capacity refusals the harness absorbs (see _Attempt.mcp). The error
+# names are the MCP's (mcp_servers/common/memory_advice.translate_http_error);
+# "scratch pool exhausted" is the MCP's own RuntimeError text.
+_BUSY_ERRORS = ("pool_full", "memory_pressure", "server_recovering", "busy")
+_BUSY_MAX_TRIES = 3
+
+
+def _busy_error(out: str) -> tuple[str | None, float]:
+    """(error kind, retry_after_s) when an MCP result is a capacity refusal,
+    else (None, 0). Also catches multi_attempt answers whose every candidate
+    was refused."""
+    if not isinstance(out, str):
+        return None, 0.0
+    if "scratch pool exhausted" in out:
+        return "scratch_exhausted", 10.0
+    try:
+        d = json.loads(out)
+    except (TypeError, ValueError):
+        return None, 0.0
+    if not isinstance(d, dict):
+        return None, 0.0
+    err = d.get("error")
+    if isinstance(err, str) and err in _BUSY_ERRORS:
+        return err, float(d.get("retry_after_s") or 5)
+    res = d.get("results")
+    if isinstance(res, list) and res and all(isinstance(r, dict) and r.get("error") in _BUSY_ERRORS for r in res):
+        return str(res[0].get("error")), float(res[0].get("retry_after_s") or 5)
+    return None, 0.0
+
+
+# The MCP words its advice with its own tool names; these four are hidden from
+# the model (harness business), so the text is rewritten to the action the
+# model can take. Applied to every MCP result (MEMORY REMINDERs ride on
+# ordinary results too).
+_HIDDEN_ADVICE = [
+    (re.compile(r"call isabelle_release_idle\(\)"), "wait (the harness has already freed the idle sessions)"),
+    (re.compile(r"isabelle_release_idle\(\)"), "the harness (it frees idle sessions for you automatically)"),
+    (re.compile(r"isabelle_release_idle"), "the harness's automatic session release"),
+    (re.compile(r"isabelle_close\(file_path, destroy=true\)"), "do nothing (the harness manages the file session)"),
+    (re.compile(r"\(isabelle_memory_status\(\) shows the numbers\)"), "(the harness logs the numbers)"),
+    (re.compile(r"isabelle_memory_status\(\)|isabelle_list_sessions\(\)"), "the harness log"),
+]
+
+
+def _strip_hidden_advice(out: str) -> str:
+    if not isinstance(out, str) or "isabelle_" not in out:
+        return out
+    for pat, repl in _HIDDEN_ADVICE:
+        out = pat.sub(repl, out)
+    return out
+
+
 _FILE_SCOPED = {"isabelle_diagnostic_messages", "isabelle_goal", "isabelle_proof_state",
                 "isabelle_command_at_line", "isabelle_query", "isabelle_local_facts",
                 "isabelle_global_facts", "isabelle_hover_info", "isabelle_definition",
@@ -232,7 +310,15 @@ def _takes_file_path(name: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 def _register_file_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
-    def read_file() -> str:
+    def read_file(**kwargs) -> str:
+        # Seen on the first P1 run: the model called read_file with a `content`
+        # argument, twice -- a 9k-token file each time, meant for write_file.
+        # The TypeError that came back threw both writes away. Route it.
+        if isinstance(kwargs.get("content"), str):
+            return ("(note: read_file takes no arguments; your `content` was treated as "
+                    "write_file(content))\n" + write_file(kwargs["content"]))
+        if kwargs:
+            return f"ERROR: read_file takes no arguments (got {sorted(kwargs)}); use write_file(content) to write."
         at.count("read_file")
         text = at.thy.read_text(encoding="utf-8")
         return "\n".join(f"{i+1:4d}| {ln}" for i, ln in enumerate(text.splitlines()))
@@ -356,6 +442,18 @@ def _register_mcp_tools(reg: agentlib.ToolRegistry, at: _Attempt, available: lis
         schema["required"] = [r for r in schema.get("required") or [] if r != "file_path"]
         desc = re.sub(r"\s+", " ", t["description"]).strip()
         desc = desc.replace("(file_path)", "()").replace("file_path, ", "").replace("file_path", "the problem file")
+        # The MCP's descriptions talk to an agent that has its memory and heap
+        # tools; ours does not (the harness does that work), so drop the MEMORY
+        # paragraph and rewrite any hidden tool name the way results are.
+        desc = re.sub(r"\s*MEMORY:.*$", "", desc)
+        desc = _strip_hidden_advice(desc)
+        if name == "isabelle_run_code":
+            # task_group / heap_session name heaps the model cannot see or
+            # build; the imports decide the image (FIELD_FROM_IMPORTS).
+            for k in ("task_group", "heap_session"):
+                props.pop(k, None)
+            schema["required"] = [r for r in schema["required"] if r not in ("task_group", "heap_session")]
+            desc = re.sub(r"\s*heap_session runs it in that heap's import context\.", "", desc)
         if name == "isabelle_fill_sorries" and at.arm.auto_fill:
             desc = ("Re-run the server-side sledgehammer on every `sorry` of the file "
                     "(write_file already does this automatically; call this to retry with a "
@@ -750,6 +848,10 @@ def _mcp_command() -> tuple[list[str], dict[str, str]]:
         "ISABELLE_MCP_LSP_FILL_PATIENCE_S": str(FILL_PATIENCE_S),
         "ISABELLE_MCP_LSP_ATTEMPT_TIMEOUT": str(ATTEMPT_TIMEOUT_S),
         "ISABELLE_MCP_LSP_CLOSE_DESTROYS": "true",
+        # warm scratch sessions (run_code / multi_attempt) per agent: 2 keeps a
+        # worker at 3 server sessions (file + 2 scratch); size ISABELLE_POOL_SIZE
+        # on the server at >= 3 x workers
+        "ISABELLE_MCP_LSP_SCRATCH_POOL_SIZE": "2",
         # start the file session on the heap its imports name (IPS patch; the
         # server must have that heap built) instead of loading from source
         "ISABELLE_MCP_LSP_FIELD_FROM_IMPORTS": "true",
@@ -919,7 +1021,8 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
         print(f"nudges         : {at.nudges}   failed completions: {at.failed_completions}")
         print(f"writes         : {at.writes} (rejected {at.rejected_writes})  fills: {at.fills} "
               f"({at.fill_sorries_proved}/{at.fill_sorries_total} sorries)  sledgehammer: "
-              f"{at.sledgehammer_found}/{at.sledgehammer_calls}")
+              f"{at.sledgehammer_found}/{at.sledgehammer_calls}  busy retries: {at.busy_retries} "
+              f"(releases {at.releases})")
     print(f"tokens         : {tokens}")
     if not passed:
         print(f"verify said    : {reason or '(no output)'}")
@@ -949,6 +1052,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
             "fill_sorries_total": at.fill_sorries_total, "fill_sorries_proved": at.fill_sorries_proved,
             "sledgehammer_calls": at.sledgehammer_calls, "sledgehammer_found": at.sledgehammer_found,
             "tool_time_s": round(at.tool_time_s, 1),
+            "busy_retries": at.busy_retries, "releases": at.releases,
         })
     results_path = Path(args.results)
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -975,8 +1079,8 @@ def main() -> int:
     p.add_argument("--owner", default=None)
     p.add_argument("--runs-dir", default=str(RUNS_DIR))
     p.add_argument("--results", default=str(RESULTS))
-    p.add_argument("--max-steps", type=int, default=150, help="0 = unlimited")
-    p.add_argument("--timeout", type=int, default=3600, help="wall-clock seconds per attempt (0 = none)")
+    p.add_argument("--max-steps", type=int, default=0, help="turn cap; 0 = unlimited (default, as upstream)")
+    p.add_argument("--timeout", type=int, default=14400, help="wall-clock seconds per attempt (default 4 h; 0 = none)")
     p.add_argument("--queue", default=None)
     p.add_argument("--model-cfg", default=str(MODEL_CFG))
     p.add_argument("--db", default=DB_PATH)

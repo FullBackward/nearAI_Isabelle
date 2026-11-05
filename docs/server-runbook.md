@@ -1,8 +1,8 @@
 # Running the experiment on the Ubuntu server
 
 *Written 2026-11-04. Target: the Ubuntu box that already hosts the Isabelle Pool
-Server (IPS) natively (x86_64, 32 logical CPUs, ~126 GiB RAM, Isabelle at
-`/opt/isabelle`), reached over SSH as an ordinary user: no `sudo`, no
+Server (IPS) natively (x86_64, 32 logical CPUs, ~126 GiB RAM, Isabelle2026 unpacked
+in the home directory as `~/Isabelle2026`, no root install), reached over SSH as an ordinary user: no `sudo`, no
 `systemctl`. IPS runs there as a user process the way its memory-scaling
 experiments ran it (`python -m server.app.main` under `nohup`, see
 `evaluation/memory_scaling/SERVER_GUIDE.md` in the IPS repo). The harness runs on
@@ -40,6 +40,34 @@ session for up to an hour and the stdio MCP must sit next to the server anyway.
 
 ## 1. Server prerequisites (one-time)
 
+### 1a0. Isabelle2026 in the home directory (no sudo)
+
+The problems were checked on Isabelle2026 (final). Heaps and user settings are
+per version, so the server's Isabelle must be that one. Unpacking the official
+tarball in `$HOME` is enough; nothing needs root.
+
+```bash
+cd ~
+curl -fLO https://www.cl.cam.ac.uk/research/hvg/Isabelle/dist/Isabelle2026_linux.tar.gz \
+  || curl -fLO https://proofcraft.systems/isabelle/dist/Isabelle2026_linux.tar.gz
+tar xzf Isabelle2026_linux.tar.gz          # -> ~/Isabelle2026 (x86_64 build)
+export PATH=$HOME/Isabelle2026/bin:$PATH
+isabelle version                           # Isabelle2026
+echo 'export PATH=$HOME/Isabelle2026/bin:$PATH' >> ~/.bashrc
+```
+
+Then register IPS against it (user-level part of the native setup: REPL
+component, Scala backend, ML heap cap under `~/.isabelle/Isabelle2026/`):
+
+```bash
+cd ~/Isabelle-Pool-Server
+kill $(cat logs/server.pid) 2>/dev/null     # if a server is running on the old version
+sed -i 's/^ISABELLE_VERSION=.*/ISABELLE_VERSION=Isabelle2026/' .env
+./deploy/native_setup.sh                    # no flags: uses the isabelle on PATH
+```
+
+An older `~/Isabelle2026-RC2` can stay; nothing points at it once PATH is changed.
+
 ### 1a. IPS at a commit with the `FIELD_FROM_IMPORTS` feature
 
 The harness starts every file session on the heap the file's imports name
@@ -50,8 +78,7 @@ Every new SSH shell on the box needs the IPS environment first (the IPS guide
 says the same):
 
 ```bash
-cd ~/Isabelle-Pool-Server && source .venv/bin/activate && export PATH=/opt/isabelle/bin:$PATH
-# Isabelle in the home directory instead: export PATH=$HOME/Isabelle2026/bin:$PATH
+cd ~/Isabelle-Pool-Server && source .venv/bin/activate && export PATH=$HOME/Isabelle2026/bin:$PATH
 ```
 
 Then update the checkout and make sure the feature is there:
@@ -71,7 +98,7 @@ harness, not inside the server.
 Start IPS as a user process (no systemd, no tmux), detached from the SSH session:
 
 ```bash
-cd ~/Isabelle-Pool-Server && source .venv/bin/activate && export PATH=/opt/isabelle/bin:$PATH
+cd ~/Isabelle-Pool-Server && source .venv/bin/activate && export PATH=$HOME/Isabelle2026/bin:$PATH
 set -a; . ./.env; set +a                       # nothing loads .env for you outside Docker
 setsid nohup python -m server.app.main > logs/server.stdout.log 2>&1 < /dev/null &
 echo $! > logs/server.pid
@@ -212,12 +239,13 @@ knobs must agree:
 
 | knob | where | rule |
 |---|---|---|
-| number of workers | shell loop below | each worker holds one Isabelle session (1.5-4 GB) plus provers |
-| `ISABELLE_POOL_SIZE` | IPS `.env` (default 3) | >= workers, or workers queue on the admission gate |
+| number of workers | shell loop below | each worker holds its file session (1.5-4 GB) plus up to 2 warm scratch sessions for `run_code`/`multi_attempt`, plus provers |
+| `ISABELLE_POOL_SIZE` | IPS `.env` (default 3) | >= 3 x workers; a full pool makes the server refuse scratch sessions (the harness frees idle ones and retries, but each refusal costs a turn) |
 | `ISABELLE_MEMORY_PRESSURE_THRESHOLD` | IPS `.env` (default 80 %) | percent of **host** RAM on a native install |
 
-Start with 4 workers and `ISABELLE_POOL_SIZE=6` (edit `.env`, then stop and start
-the IPS process as in 1a; the memory-scaling runs used 40 on this box). The IMO tier has only 36 rows, so more than 6 workers gains little; the
+Start with 4 workers and `ISABELLE_POOL_SIZE=12` (edit `.env`, then stop and start
+the IPS process as in 1a; the memory-scaling runs used 40 on this box). For the
+single Q1 run, 3 is the minimum and 6 is comfortable. The IMO tier has only 36 rows, so more than 6 workers gains little; the
 miniF2F pilot (60 problems x 2 arms) can use 6-8 on this box. Sledgehammer spawns
 several provers per call; 32 cores cover 6 workers comfortably.
 
@@ -226,7 +254,7 @@ several provers per call; 32 cores cover 6 workers comfortably.
 ### 5a. The first run: Q1, one attempt, plain arm
 
 One SSH shell. The attempt is detached, so the shell can be closed once it has
-started; it ends by itself (150 steps or 3600 s at most).
+started; it ends by itself (4 h wall clock at most, no step cap, as upstream).
 
 ```bash
 cd ~/nearAI_Isabelle && source .venv/bin/activate
@@ -236,7 +264,7 @@ curl -s localhost:8000/healthz                                                  
 
 mkdir -p runs
 setsid nohup .venv/bin/python run_isabelle_solver.py --problem imo_2026_p1 --arm plain \
-      --max-steps 150 --timeout 3600 > runs/q1_plain_rep0.log 2>&1 < /dev/null &
+      --timeout 14400 > runs/q1_plain_rep0.log 2>&1 < /dev/null &
 echo $!                                                                               # its PID
 ```
 
@@ -271,7 +299,7 @@ directory (`--rep 0` again overwrites the first).
 # 5c. workers, detached (survive logout); --loop 0 = run until the queue drains
 for i in 1 2 3 4; do
   setsid nohup .venv/bin/python run_isabelle_solver.py --loop 0 --owner "w$i" \
-        --max-steps 150 --timeout 3600 > runs/worker$i.log 2>&1 < /dev/null &
+        --timeout 14400 > runs/worker$i.log 2>&1 < /dev/null &
   echo $! >> runs/workers.pid
 done
 pgrep -af run_isabelle_solver        # four of them
@@ -280,9 +308,9 @@ pgrep -af run_isabelle_solver        # four of them
 `export ISABELLE_POOL_SERVER=...` must be in the shell that starts the workers (it
 is inherited); the one-off attempt in 5a inherits it the same way.
 
-Budgets: 150 steps and 3600 s per attempt; the skeleton arm's `fill_sorries` jobs
+Budgets: no step cap and 4 h wall clock per attempt; the skeleton arm's `fill_sorries` jobs
 are capped at 30 s of sledgehammer per `sorry` and 600 s per job. Worst case for
-the tier is 36 attempt-hours divided by the worker count.
+the tier is 36 attempts x 4 h divided by the worker count.
 
 Monitoring (any later SSH session):
 
@@ -337,5 +365,5 @@ rendered from.
 - [ ] `curl -sI https://api.deepseek.com` answers
 - [ ] `bigstep_check.py` prints six `PASS`; `selftest` and `pytest` pass
 - [ ] `ISABELLE_POOL_SERVER` exported; `config/model.json` points at a mode-600 key file; model id confirmed
-- [ ] `ISABELLE_POOL_SIZE` >= workers; server and workers started with `setsid nohup`, PIDs saved
+- [ ] `ISABELLE_POOL_SIZE` >= 3 x workers; server and workers started with `setsid nohup`, PIDs saved
 - [ ] the owner has approved the spend for this run

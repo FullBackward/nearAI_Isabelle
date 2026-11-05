@@ -25,8 +25,8 @@ Differences forced by Isabelle:
   query tools (file_path injected by the harness);
 - the verifier is `harness/ib.py`: textual rules + `isabelle build` through
   IPS's bigstep endpoint (see README "What counts as solved");
-- finite default budgets (150 steps, 60 min) because this is a paired
-  comparison on a 16 GB machine, not a leaderboard submission.
+- no step cap, as upstream; a 4 h wall-clock cap per attempt (decided 2026-11-05
+  after the first Q1 run spent 93 of its 150 capped turns exploring before the first write).
 
 ## Arms
 
@@ -125,8 +125,8 @@ heaps built on the server for the purpose; see `runs/bigstep_check_imo2026.log`)
 1. Benchmark: miniF2F-test pilot (recommended) vs a PutnamBench slice first.
 2. `skeleton` without per-goal sledgehammer (recommended, cleaner contrast)
    vs with it (closer to "IPS as shipped plus a prompt").
-3. Budgets: 150 steps / 60 min per attempt; `fill_sorries` 30 s per sorry,
-   600 s per job. Upstream ran unbounded.
+3. Budgets: no step cap, 4 h wall clock per attempt; `fill_sorries` 30 s per sorry,
+   600 s per job. Upstream: no step cap, 3-day wall clock.
 4. Model: DeepSeek V4 Pro (as upstream's hard tier and the IPS comparison runs)
    vs V4 Flash for cost.
 5. Imports frozen (current) vs allowing extra HOL-distribution imports

@@ -103,8 +103,8 @@ for i in 1 2; do nohup .venv/bin/python run_isabelle_solver.py --loop 0 > runs/w
 .venv/bin/python harness/ib.py queue-init --source imo2026 --arm plain skeleton --repeats 3
 ```
 
-Budgets default to `--max-steps 150 --timeout 3600` per attempt (upstream ran
-unbounded; this is a comparison on a laptop-class server). Two workers is the
+Budgets follow upstream: no step cap, wall clock only (`--timeout 14400`, 4 h per
+attempt; `--max-steps N` adds a turn cap if you want one). Two workers is the
 practical ceiling on a 16 GB host: each attempt holds one Isabelle session
 (1.5-4 GB) plus the sledgehammer provers.
 

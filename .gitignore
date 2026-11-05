@@ -4,8 +4,9 @@ config/model*.json
 !config/model.example.json
 # the benchmarks are cloned, not vendored
 benchmarks/
-# run artifacts
+# run artifacts (runs-server/: attempts copied back from the server, local only)
 runs/
+runs-server/
 db.sql
 *.sqlite
 problems.tsv

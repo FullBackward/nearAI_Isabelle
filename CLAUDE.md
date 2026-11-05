@@ -20,7 +20,9 @@ docs/experiment-design.md the design and open decisions.
   (`read_file`/`write_file`, the arm's MCP tools with `file_path` injected, `completed`,
   `disproved`/`write_disproof`) -> `agent.run` with `should_continue` nudging -> re-verify ->
   write `transcript.jsonl` + `transcript.md` into the bench dir (`_Transcript`,
-  `_render_transcript_md`) and append `runs/results.jsonl`. The solver rule lives in `extract_solver_calls` /
+  `_render_transcript_md`) and append `runs/results.jsonl`. `_Attempt.mcp` absorbs server capacity
+  refusals (release idle scratch sessions, wait, retry); results and tool descriptions that name the hidden
+  memory/heap tools are rewritten. The solver rule lives in `extract_solver_calls` /
   `sanctioned_from_output`; the skeleton arm's automatic fill in `_auto_fill`.
 - `harness/arms.py` -- the only place arms differ: `mcp_tools`, `auto_fill`, `strategy`.
 - `harness/ib.py` -- manifest (`prepare`), staging (proof stripping via `sorryfy` /

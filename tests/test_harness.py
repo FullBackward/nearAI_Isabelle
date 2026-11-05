@@ -187,3 +187,72 @@ def test_transcript_records_everything(tmp_path, monkeypatch):
                    "tool result `add`", "five, done", "## Model calls"):
         assert needle in md, needle
     agent.close()
+
+
+def test_capacity_refusal_is_released_and_retried(tmp_path, monkeypatch):
+    """pool_full once -> the harness calls isabelle_release_idle itself, waits,
+    retries, and the model sees the successful answer; a refusal that persists
+    comes back with the hidden tool names rewritten into 'retry' advice."""
+    monkeypatch.setattr(rs.time, "sleep", lambda s: None)
+    at, b, reg = make(tmp_path)
+    answers = [json.dumps({"error": "pool_full", "retry_after_s": 3,
+                           "advice": ["release what you no longer need (isabelle_release_idle()) and retry in 3 s."]}),
+               json.dumps({"success": True, "output": "found 1 theorem(s)"})]
+    orig = b.call
+
+    def call(name, args, timeout=0):
+        if name == "isabelle_query":
+            b.calls.append((name, args))
+            return answers.pop(0)
+        return orig(name, args, timeout)        # FakeBridge.call records the others
+    b.call = call
+    out = at.mcp("isabelle_query", {"command": "find_theorems foo"})
+    assert "found 1 theorem" in out
+    assert [n for n, _ in b.calls] == ["isabelle_query", "isabelle_release_idle", "isabelle_query"]
+    assert at.busy_retries == 1 and at.releases == 1
+
+    answers[:] = [json.dumps({"error": "memory_pressure", "retry_after_s": 5,
+                              "advice": ["Release the 2 session(s) ...: call isabelle_release_idle(), then retry in 5 s.",
+                                         "Retry in 5 s; if it keeps failing, tell the user (isabelle_memory_status() shows the numbers)."]})] * 3
+    out = at.mcp("isabelle_query", {"command": "find_theorems bar"})
+    assert "isabelle_release_idle" not in out and "isabelle_memory_status" not in out
+    assert "memory_pressure" in out and "harness" in out
+    assert at.busy_retries == 3 and at.releases == 3
+
+
+def test_exposed_tools_do_not_reference_hidden_ones(tmp_path):
+    """The MCP's own descriptions address an agent that has the memory/heap
+    tools; ours must not see those names or the heap-naming parameters."""
+    at, b, reg = make(tmp_path)
+    available = [
+        {"name": "isabelle_multi_attempt", "description":
+            "Try several candidates ... MEMORY: a candidate result with error memory_pressure "
+            "means ... call isabelle_release_idle(), then retry; if the advice says the memory is "
+            "held by others, stop and tell the user.",
+         "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}, "line": {"type": "integer"},
+                        "candidates": {"type": "array"}}, "required": ["file_path", "line", "candidates"]}},
+        {"name": "isabelle_run_code", "description":
+            "Run an independent Isar snippet on a warm scratch session. heap_session runs it in that "
+            "heap's import context. Returns {success, output}.",
+         "parameters": {"type": "object", "properties": {"chunk": {"type": "string"}, "imports": {"type": "array"},
+                        "task_group": {"type": "string"}, "heap_session": {"type": "string"},
+                        "timeout": {"type": "number"}}, "required": ["chunk"]}},
+    ]
+    at.arm = type(at.arm)(**{**at.arm.__dict__, "mcp_tools": ["isabelle_multi_attempt", "isabelle_run_code"]})
+    rs._register_mcp_tools(reg, at, available)
+    tools = {t["function"]["name"]: t["function"] for t in reg.to_openai()}
+    ma = tools["isabelle_multi_attempt"]
+    assert "isabelle_release_idle" not in ma["description"] and "MEMORY:" not in ma["description"]
+    assert "file_path" not in ma["parameters"]["properties"]
+    rc = tools["isabelle_run_code"]
+    assert set(rc["parameters"]["properties"]) == {"chunk", "imports", "timeout"}
+    assert "heap_session" not in rc["description"]
+
+
+def test_read_file_with_content_is_routed_to_write_file(tmp_path):
+    at, b, reg = make(tmp_path)
+    new = THY.replace("sorry", "by simp")
+    out = reg.invoke("read_file", json.dumps({"content": new}))
+    assert "treated as write_file" in out and at.writes == 1
+    assert (tmp_path / "t1.thy").read_text() == new
+    assert reg.invoke("read_file", json.dumps({"foo": 1})).startswith("ERROR: read_file takes no arguments")
