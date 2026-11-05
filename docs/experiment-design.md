@@ -160,3 +160,52 @@ heaps built on the server for the purpose; see `runs/bigstep_check_imo2026.log`)
   the other. `ISABELLE_POOL_SIZE=6` is aspirational here.
 - A fresh `heap build` leaves the cgroup counting its page cache as used
   memory; a container restart clears it.
+
+## Findings from the first IMO 2026 runs (2026-11-05)
+
+Q1, plain arm, DeepSeek, no step cap. The attempt was stopped by hand after
+its first `completed()`; the file it submitted (854 lines, 3 metis calls, no
+`sorry`, every frozen statement intact) is kept beside the transcript in
+`runs-server/Q1_plain_rerun1/` (local only).
+
+- **Sledgehammer output gets transplanted onto other goals, and metis then
+  diverges.** The model asked sledgehammer about a small helper step
+  (`M \<in># add_mset L A`), got a metis call preplayed in 19 ms, deleted the
+  helper steps and pasted the same call onto the enclosing `show False`.
+  There it never terminates (still running after 7 min in a session; it is
+  what held the build past its limit). The solver rule only requires that a
+  metis/smt call *came from* a sledgehammer result in the run, so the write
+  was accepted. **Decision (owner): this stays allowed.** It is a finding
+  about how DeepSeek uses metis in Isabelle, not something the harness should
+  mask: binding a result to the goal it was found for would tighten the rule
+  beyond upstream's. Expect it to recur; the per-step check below is what
+  catches it now.
+- **A timed-out session check read as "no errors".** The session checks a
+  written file under a wall budget (the MCP's `LOAD_TIMEOUT`, 120 s then) and
+  returns a *partial* report when it expires; the running step has no
+  message, and later commands are unprocessed. The harness only read the
+  error list, printed `no errors; sorry present: False`, and the model
+  called `completed()` on a file whose termination theorem was in fact broken
+  (`show ?thesis` inside a `\<forall>k` proof, lines 667-673) and whose line
+  433 metis diverges. Fixed: `write_file` now reports `CHECK TIMED OUT ...
+  still running line N` as an error, `completed()` refuses to build such a
+  file and names the line, and the budget is 600 s (`IB_LOAD_TIMEOUT`; the
+  bridge's tool timeout tracks it so the partial report always arrives).
+- **The build verifier's timeout was reported as the model's failure.** With
+  the build stuck on that metis the bigstep call hit the harness's 960 s wait
+  and came back `build service unavailable: ReadTimeout`; `completed()` told
+  the model to "fix what it reported". Fixed: an outage is now worded as an
+  outage (`VERIFIER UNAVAILABLE`, not counted as a failed completion; the
+  results line says `verifier unavailable`), and `IB_BUILD_TIMEOUT` defaults
+  to 1800 s.
+- **IPS: a timed-out bigstep build leaves the ML process running.** The
+  server kills the `isabelle build` wrapper at its limit but then waits for
+  the pipes to close, which the orphaned `poly` keeps open; the request does
+  not answer, the per-theory lock stays held, and the next build of the same
+  text queues behind it. Seen as a second `poly` appearing after the harness
+  was killed. Not fixed here (IPS side, `build_verify.py` `_run_build`); kill
+  stray `poly` processes by hand after aborting a run.
+- Cost of that attempt: 280 model calls, ~0.5 M prompt tokens per call near
+  the end with 99 % cache hits, 54 `isabelle_multi_attempt` and 111
+  `isabelle_run_code` calls against 9 sledgehammer calls -- the plain arm
+  spends most of its tool budget on checking, not on the ATP.

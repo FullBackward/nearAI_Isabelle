@@ -104,9 +104,13 @@ for i in 1 2; do nohup .venv/bin/python run_isabelle_solver.py --loop 0 > runs/w
 ```
 
 Budgets follow upstream: no step cap, wall clock only (`--timeout 14400`, 4 h per
-attempt; `--max-steps N` adds a turn cap if you want one). Two workers is the
-practical ceiling on a 16 GB host: each attempt holds one Isabelle session
-(1.5-4 GB) plus the sledgehammer provers.
+attempt; `--max-steps N` adds a turn cap if you want one). Two inner limits
+matter: the session's check of a written file (`IB_LOAD_TIMEOUT`, 600 s; a check
+that expires is reported as an error naming the running line, and `completed()`
+will not build such a file) and the verifier's build (`IB_BUILD_TIMEOUT`,
+1800 s; a build service that does not answer is reported as an outage, not as a
+failed proof). Two workers is the practical ceiling on a 16 GB host: each
+attempt holds one Isabelle session (1.5-4 GB) plus the sledgehammer provers.
 
 ## What counts as solved
 
@@ -122,9 +126,17 @@ final `.thy`:
    every definition block and every theorem statement, and all of them must
    be proved -- the same rule as the Lean harnesses' `verify.py`;
 3. no helper definition reuses a name that occurs in the statement (Isabelle
-   lets a local `definition prime` shadow the imported one);
+   lets a local `definition prime` shadow the imported one), and no ML inside a
+   proof method (`tactic`/`raw_tactic`);
 4. the whole theory builds (`isabelle build`, through the Pool Server's
    bigstep endpoint).
+
+The bytes that passed are kept as `verified.thy` in the bench dir, the file is
+frozen from that moment on (the model may still write its report, not the
+file), and the harness's own final verdict is taken on those bytes. A run that
+ends by timeout is judged on the working file, but only built when the session
+finished checking it. `disproved()` is accepted only after `write_disproof`
+reported a passing build.
 
 PutnamBench's factored answers follow upstream: `wsolution` inlines the
 reference answer (leaderboard setting), `full` leaves `undefined` for the agent

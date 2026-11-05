@@ -64,11 +64,20 @@ IPS_ROOT = Path(os.environ.get("ISABELLE_POOL_SERVER", "~/GitHub/Isabelle-Pool-S
 GYM_URL = os.environ.get("IB_GYM_URL", "http://localhost:8000")
 MCP_PYTHON = os.environ.get("IPS_MCP_PYTHON", sys.executable)
 
-TOOL_TIMEOUT_S = 330          # one MCP call; must exceed the fill patience
 FILL_TIMEOUT_S = 30           # sledgehammer budget per `sorry`
 FILL_MAX_TOTAL_S = 600        # per fill job
 FILL_PATIENCE_S = 240         # the MCP returns `continuing` after this
 ATTEMPT_TIMEOUT_S = 180       # multi_attempt / run_code per candidate
+# Wall budget for the session's check of the whole file after a write. The
+# MCP default (120 s) was too short for an 850-line file; isabelle-humanize
+# needed 600 s for the IMO P1 theory class. A check that expires is reported
+# as such, naming the running line (see _Attempt.diagnostics).
+LOAD_TIMEOUT_S = int(os.environ.get("IB_LOAD_TIMEOUT", "600"))
+# One MCP call through the bridge. Must exceed the fill patience and the load
+# budget plus a diagnostics call, otherwise the bridge cuts the call before the
+# server's partial report arrives and the model sees a generic timeout instead
+# of the line that is stuck.
+TOOL_TIMEOUT_S = max(330, LOAD_TIMEOUT_S + 120)
 UNLIMITED_STEPS = 10_000_000
 
 
@@ -163,7 +172,9 @@ class _Attempt:
         self.explanation = ""
         self.nudges = 0
         self.failed_completions = 0
+        self.verifier_unavailable = 0
         self.last_verify = ""
+        self.disproof_build_ok: bool | None = None   # last write_disproof build (F7)
         # effort counters
         self.tool_calls: dict[str, int] = {}
         self.writes = 0
@@ -210,6 +221,12 @@ class _Attempt:
             time.sleep(min(max(retry, 2.0), 30.0))
         out = _strip_hidden_advice(out)
         self.tool_time_s += time.time() - t0
+        # The prover side of the conversation: every MCP call, including the
+        # ones the harness makes inside write_file/completed (sync reports,
+        # diagnostics, fill jobs), goes into the attempt's transcript too.
+        agentlib._emit(agentlib.TOOL_SINK, {
+            "kind": "mcp", "name": name, "arguments": json.dumps(args, ensure_ascii=False),
+            "result": out, "elapsed_s": round(time.time() - t0, 3), "retries": attempt})
         if name in SOLVER_SOURCE_TOOLS:
             self.sanctioned |= sanctioned_from_output(out)
         if name == "isabelle_sledgehammer":
@@ -219,8 +236,35 @@ class _Attempt:
         return out
 
     # -- diagnostics summary used after every write ------------------------ #
+    def stuck_line(self) -> int | None:
+        """The line the prover was still running when the last full-file check
+        hit its wall budget (LOAD_TIMEOUT_S), or None if the check finished.
+        The session checks the file under a budget and hands back a PARTIAL
+        report when it expires; a step still running at that point has no
+        message, so the error list alone looks clean. Q1 rerun, 2026-11-05: a
+        divergent metis made every check expire, the harness said "no errors",
+        the model called completed() and the build hung on the same step."""
+        raw = self.mcp("isabelle_sync", {})
+        try:
+            d = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if d.get("success"):
+            return None
+        if isinstance(d.get("stuck_line"), int):
+            return d["stuck_line"]
+        m = re.search(r"still running at line (\d+)", str(d.get("error") or ""))
+        return int(m.group(1)) if m else None
+
+    def line_text(self, n: int) -> str:
+        try:
+            return self.thy.read_text(encoding="utf-8").splitlines()[n - 1].strip()[:200]
+        except (IndexError, OSError):
+            return ""
+
     def diagnostics(self) -> tuple[str, bool, bool]:
         """(text for the agent, has_errors, has_sorry)"""
+        stuck = self.stuck_line()
         raw = self.mcp("isabelle_diagnostic_messages", {"severity": "error"})
         try:
             d = json.loads(raw)
@@ -231,14 +275,22 @@ class _Attempt:
         for m in msgs[:25]:
             lines.append(f"  line {m.get('line')}:{m.get('col')} [{m.get('kind')}] {str(m.get('text') or '').strip()[:600]}")
         has_sorry = bool(d.get("used_sorry")) or bool(re.search(r"\b(sorry|oops)\b", ib.strip_comments(self.thy.read_text(encoding='utf-8'))))
-        if msgs:
+        if stuck is not None:
+            text = (f"CHECK TIMED OUT: the prover could not finish checking the file within "
+                    f"{LOAD_TIMEOUT_S}s -- it was still running line {stuck}: `{self.line_text(stuck)}`. "
+                    "A step that runs this long will not build either: treat it as FAILED and "
+                    "replace it (a method sledgehammer found for one goal need not terminate on "
+                    "another). Commands after it were not checked.")
+            if msgs:
+                text += f"\nAlso {len(msgs)} error(s) in what was checked:\n" + "\n".join(lines)
+        elif msgs:
             text = f"{len(msgs)} error(s):\n" + "\n".join(lines)
         else:
             text = "no errors"
             if d.get("proof_open"):
                 text += "; a proof is still OPEN (unfinished)"
         text += f"; sorry present: {has_sorry}"
-        return text, bool(msgs), has_sorry
+        return text, bool(msgs) or stuck is not None, has_sorry
 
 
 # Server-capacity refusals the harness absorbs (see _Attempt.mcp). The error
@@ -331,6 +383,10 @@ def _register_file_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
 
     def write_file(content: str) -> str:
         at.count("write_file")
+        if at.kind is not None:
+            # DeepSeek batches tool calls; a write in the same turn as a
+            # passing completed() would change the file after its verdict.
+            return f"The run is over ({at.kind}): the file is frozen and this write was NOT applied."
         content = re.sub(r"[\uD800-\uDFFF]", "", content)  # lone surrogates kill the prover
         if not content.strip():
             return "ERROR: write_file needs the COMPLETE new file content."
@@ -499,13 +555,36 @@ def _register_finishing_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
     def completed() -> str:
         at.count("completed")
         text = at.thy.read_text(encoding="utf-8")
+        # A file whose session check never finished is not sent to the build:
+        # the build would sit on the same step until its own limit (16 min
+        # lost per call on the Q1 rerun) and come back with no usable reason.
+        stuck = at.stuck_line()
+        if stuck is not None:
+            at.failed_completions += 1
+            report = (f"FAIL [{at.entry['name']}] the prover never finished checking the file: "
+                      f"still running line {stuck}: `{at.line_text(stuck)}` after {LOAD_TIMEOUT_S}s. "
+                      "Not built.")
+            at.last_verify = report
+            return (report + "\n\nVERIFY FAILED. You are NOT done. That step does not terminate "
+                    "(or is far too slow): replace it with a different proof and call completed() again.")
         ok, report = ib.verify_text(text, at.entry, at.variant, gym_url=GYM_URL)
         at.last_verify = report
         if ok:
             at.kind = "completed"
+            # The bytes that passed, kept beside the working file: the final
+            # verdict is taken on these, whatever happens to the file later.
+            (at.bench_dir / "verified.thy").write_text(text, encoding="utf-8")
             return (report + "\n\nVERIFY PASSED. The problem is SOLVED and you are DONE.\n"
                     "Write your final report as your next message -- the mathematical idea, "
                     "what you tried, what worked -- and then stop. Do not call any more tools.")
+        if "verifier unavailable" in report:
+            # Infrastructure, not the proof: the build service did not answer.
+            # Not counted as a failed completion and not blamed on the model.
+            at.verifier_unavailable += 1
+            return (report + "\n\nVERIFIER UNAVAILABLE. Your file was NOT judged: the build service "
+                    "did not answer, which is a fault on our side, not in your proof. Do not change "
+                    "the file because of this. Call completed() again; if it happens repeatedly, "
+                    "keep re-checking the file in the session in the meantime.")
         at.failed_completions += 1
         return (report + "\n\nVERIFY FAILED. You are NOT done. The exact verifier output is "
                 "above -- it names the precise reason. Fix what it reported and call "
@@ -532,6 +611,11 @@ def _register_finishing_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
                     "done. Use write_disproof(content) to write an Isabelle theory that derives "
                     "False from the theorem's hypotheses (or proves the negation of its "
                     "conclusion) with no sorry, then call disproved() again.")
+        if not at.disproof_build_ok:
+            return (f"{name} has not passed a build (last write_disproof build: "
+                    + ("FAILED" if at.disproof_build_ok is False else "never run") +
+                    "). The claim was NOT recorded and you are NOT done. Fix the disproof until "
+                    "write_disproof reports `Build: OK`, then call disproved() again.")
         DEFECTS_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy(path, DEFECTS_DIR / f"{at.entry['name']}.DISPROOF.thy")
         (DEFECTS_DIR / f"{at.entry['name']}.claim.md").write_text(
@@ -560,10 +644,13 @@ def _register_finishing_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
 
     def write_disproof(content: str) -> str:
         at.count("write_disproof")
+        if at.kind is not None:
+            return f"The run is over ({at.kind}): nothing more is written."
         (at.bench_dir / "DISPROOF.thy").write_text(content, encoding="utf-8")
         ok, log = ib.build_check(content, {"name": ib.parse_header(content)[0] if content.strip().startswith(("theory", "(*")) else "DISPROOF",
                                            "field": at.entry["field"], "sessions": at.entry["sessions"]},
                                  gym_url=GYM_URL)
+        at.disproof_build_ok = ok
         return ("DISPROOF.thy written. Build: " + ("OK" if ok else "FAILED\n" + log[:3000]))
 
     reg.register(
@@ -847,6 +934,7 @@ def _mcp_command() -> tuple[list[str], dict[str, str]]:
         "ISABELLE_MCP_LSP_FILL_MAX_TOTAL_S": str(FILL_MAX_TOTAL_S),
         "ISABELLE_MCP_LSP_FILL_PATIENCE_S": str(FILL_PATIENCE_S),
         "ISABELLE_MCP_LSP_ATTEMPT_TIMEOUT": str(ATTEMPT_TIMEOUT_S),
+        "ISABELLE_MCP_LSP_LOAD_TIMEOUT": str(LOAD_TIMEOUT_S),
         "ISABELLE_MCP_LSP_CLOSE_DESTROYS": "true",
         # warm scratch sessions (run_code / multi_attempt) per agent: 2 keeps a
         # worker at 3 server sessions (file + 2 scratch); size ISABELLE_POOL_SIZE
@@ -862,6 +950,36 @@ def _mcp_command() -> tuple[list[str], dict[str, str]]:
 
 OPEN_RETRIES = 8
 OPEN_RETRY_S = 60.0
+
+
+def _final_verify(at: _Attempt, entry: dict, variant: str) -> tuple[bool, str]:
+    """The harness's own verdict on an attempt, taken while its session is
+    still up. Judged on the bytes completed() verified (verified.thy) when
+    there are any; otherwise on the working file, and then only built when
+    the session finished checking it -- a file the prover is still running
+    would cost the whole build limit and leave an orphaned build on the
+    server (Q1 rerun, 2026-11-05)."""
+    snap = at.bench_dir / "verified.thy"
+    if snap.exists():
+        text = snap.read_text(encoding="utf-8")
+    elif at.thy.exists():
+        text = at.thy.read_text(encoding="utf-8")
+    else:
+        text = ""
+    if not text.strip():
+        return False, "no file"
+    ok, report = ib.verify_text(text, entry, variant, build=False, gym_url=GYM_URL)
+    if not ok:
+        return ok, report
+    if not snap.exists():
+        try:
+            stuck = at.stuck_line()
+        except Exception:                                # noqa: BLE001
+            stuck = None
+        if stuck is not None:
+            return False, (f"FAIL [{entry['name']}] the prover never finished checking the file: "
+                           f"still running line {stuck}: `{at.line_text(stuck)}`. Not built.")
+    return ib.verify_text(text, entry, variant, gym_url=GYM_URL)
 
 
 def _open_with_retries(bridge: MCPBridge, thy: Path) -> str:
@@ -919,6 +1037,8 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
     timed_out = False
     setup_error: str | None = None
     at: _Attempt | None = None
+    final: tuple[bool, str] | None = None
+    elapsed_agent: float | None = None
     try:
         with MCPBridge(cmd, env, cwd=str(IPS_ROOT), startup_timeout=120) as bridge:
             at = _Attempt(entry, variant, arm, bench_dir, bridge, not args.no_enforce_solver_rule)
@@ -983,6 +1103,10 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
                 "SELECT COUNT(*) FROM messages WHERE trajectory_id=? AND role='compaction'",
                 (result.trajectory_id if result else "",)).fetchone()[0]
             agent.close()
+            elapsed_agent = time.time() - t0
+            # The definitive check is OURS, not the agent's claim -- taken
+            # while the session is still up (see _final_verify).
+            final = _final_verify(at, entry, variant)
             try:
                 bridge.call("isabelle_close", {"file_path": str(at.thy), "destroy": True}, timeout=60)
             except Exception:                            # noqa: BLE001
@@ -991,11 +1115,12 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
         setup_error = f"{type(e).__name__}: {e}"
         compactions = 0
         print(f"[harness] ERROR: {setup_error}", flush=True)
-    elapsed = time.time() - t0
+    elapsed = elapsed_agent if elapsed_agent is not None else time.time() - t0
 
-    # The definitive check is OURS, re-run here, not the agent's claim.
-    text = (bench_dir / f"{problem}.thy").read_text(encoding="utf-8") if (bench_dir / f"{problem}.thy").exists() else ""
-    passed, report = (ib.verify_text(text, entry, variant, gym_url=GYM_URL) if text else (False, "no file"))
+    if final is None:   # the session never came up: judge the file blind
+        text = (bench_dir / f"{problem}.thy").read_text(encoding="utf-8") if (bench_dir / f"{problem}.thy").exists() else ""
+        final = (ib.verify_text(text, entry, variant, gym_url=GYM_URL) if text else (False, "no file"))
+    passed, report = final
     reason = next((l.strip() for l in reversed(report.splitlines()) if l.strip().startswith("FAIL [")), "")
     if not reason and not passed:
         reason = (setup_error or report.strip().splitlines()[-1] if report.strip() else "")
@@ -1047,6 +1172,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
     if at is not None:
         row.update({
             "finishing_tool": at.kind, "nudges": at.nudges, "failed_completions": at.failed_completions,
+            "verifier_unavailable": at.verifier_unavailable,
             "tool_calls": at.tool_calls, "writes": at.writes, "rejected_writes": at.rejected_writes,
             "fills": at.fills, "auto_fills": at.auto_fills,
             "fill_sorries_total": at.fill_sorries_total, "fill_sorries_proved": at.fill_sorries_proved,

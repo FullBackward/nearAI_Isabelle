@@ -8,8 +8,9 @@
     python3 scripts/transcript_view.py ... --summary   # one line per record (what happened, in order)
 
 Each record is one model call (`chat`: finish reason, tokens, seconds, the
-reply's reasoning, content and tool calls) or one tool execution (`tool`: name,
-arguments, result). Reasoning and tool results are cut at --width characters
+reply's reasoning, content and tool calls), one tool execution (`tool`: name,
+arguments, result) or one call the harness itself made to the prover inside a
+tool (`mcp`: the sync report after a write, the diagnostics, a fill job). Reasoning and tool results are cut at --width characters
 unless --full is given; the jsonl itself is never truncated (see transcript.md
 for the whole thing once the attempt is over).
 """
@@ -62,9 +63,13 @@ def render(rec: dict, width: int, summary: bool) -> str:
             fn = t.get("function") or {}
             out.append(f"  -> {fn.get('name')}({_args(fn.get('arguments', ''), width)})")
         return "\n".join(out)
-    if rec.get("kind") == "tool":
-        head = (f"#{n} TOOL   {rec.get('name')}  {rec.get('elapsed_s')}s"
-                + (f"  error={rec.get('error')}" if rec.get("error") else ""))
+    if rec.get("kind") in ("tool", "mcp"):
+        # `tool`: a call the model made; `mcp`: a call the harness made to the
+        # prover on its behalf (sync reports, diagnostics, fill jobs).
+        label = "TOOL  " if rec.get("kind") == "tool" else "MCP   "
+        head = (f"#{n} {label} {rec.get('name')}  {rec.get('elapsed_s')}s"
+                + (f"  error={rec.get('error')}" if rec.get("error") else "")
+                + (f"  retries={rec.get('retries')}" if rec.get("retries") else ""))
         if summary:
             res = rec.get("result") or ""
             return head + "  -> " + _cut(res.splitlines()[0] if res else "", 100)

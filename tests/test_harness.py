@@ -25,11 +25,14 @@ class FakeBridge:
     def __init__(self):
         self.calls: list[tuple[str, dict]] = []
         self.diag = {"messages": [], "success": True, "proof_open": False, "used_sorry": True}
+        self.sync = {"synced": True, "success": True, "proof_open": False, "error": None, "stuck_line": None}
         self.fill = {"filled": 0, "n": 0, "continuing": False, "results": [], "patched_text": None}
         self.sh = {"found": True, "results": [{"method": "by (metis add.commute)"}]}
 
     def call(self, name, args, timeout=0):
         self.calls.append((name, args))
+        if name == "isabelle_sync":
+            return json.dumps(self.sync)
         if name == "isabelle_diagnostic_messages":
             return json.dumps(self.diag)
         if name == "isabelle_fill_sorries":
@@ -95,7 +98,8 @@ def test_skeleton_auto_fill_writes_patch_back(tmp_path):
     assert at.auto_fills == 1 and at.fill_sorries_proved == 1
     assert "smt (verit) TrueI" in at.sanctioned
     names = [c[0] for c in b.calls]
-    assert names == ["isabelle_diagnostic_messages", "isabelle_fill_sorries", "isabelle_diagnostic_messages"]
+    assert names == ["isabelle_sync", "isabelle_diagnostic_messages", "isabelle_fill_sorries",
+                     "isabelle_sync", "isabelle_diagnostic_messages"]
 
 
 def test_skeleton_no_auto_fill_on_errors(tmp_path):
@@ -103,13 +107,13 @@ def test_skeleton_no_auto_fill_on_errors(tmp_path):
     b.diag = {"messages": [{"line": 4, "col": 1, "kind": "theorem", "text": "Bad"}], "success": False}
     out = reg.invoke("write_file", json.dumps({"content": THY}))
     assert "1 error(s)" in out
-    assert [c[0] for c in b.calls] == ["isabelle_diagnostic_messages"]
+    assert [c[0] for c in b.calls] == ["isabelle_sync", "isabelle_diagnostic_messages"]
 
 
 def test_plain_arm_never_auto_fills(tmp_path):
     at, b, reg = make(tmp_path, arm="plain")
     reg.invoke("write_file", json.dumps({"content": THY}))
-    assert [c[0] for c in b.calls] == ["isabelle_diagnostic_messages"]
+    assert [c[0] for c in b.calls] == ["isabelle_sync", "isabelle_diagnostic_messages"]
 
 
 def test_completed_runs_textual_verifier(tmp_path, monkeypatch):
@@ -256,3 +260,112 @@ def test_read_file_with_content_is_routed_to_write_file(tmp_path):
     assert "treated as write_file" in out and at.writes == 1
     assert (tmp_path / "t1.thy").read_text() == new
     assert reg.invoke("read_file", json.dumps({"foo": 1})).startswith("ERROR: read_file takes no arguments")
+
+
+def test_timed_out_check_is_an_error_and_blocks_the_build(tmp_path, monkeypatch):
+    """Q1 rerun 2026-11-05: a divergent metis made the session's full-file
+    check expire; the error list was empty, the harness said "no errors", and
+    completed() sent the file to a build that hung on the same step."""
+    at, b, reg = make(tmp_path, arm="skeleton")
+    rs._register_finishing_tools(reg, at)
+    b.sync = {"synced": True, "success": False, "error": "timed out (still running at line 5)",
+              "stuck_line": 5}
+    b.diag = {"messages": [], "success": False, "proof_open": False, "used_sorry": False}
+    out = reg.invoke("write_file", json.dumps({"content": THY}))
+    assert "CHECK TIMED OUT" in out and "line 5" in out and "sorry" in out
+    assert "fill_sorries" not in out                        # a stuck check is an error: no auto-fill
+    built = []
+    monkeypatch.setattr(rs.ib, "build_check", lambda text, entry, **kw: built.append(1) or (True, "ok"))
+    at.thy.write_text(THY.replace("sorry", "by simp"))
+    out = reg.invoke("completed", "{}")
+    assert "VERIFY FAILED" in out and "still running line 5" in out and not built
+    assert at.failed_completions == 1 and at.kind is None
+
+
+def test_verifier_outage_is_not_a_failed_completion(tmp_path, monkeypatch):
+    at, b, reg = make(tmp_path)
+    rs._register_finishing_tools(reg, at)
+    at.thy.write_text(THY.replace("sorry", "by simp"))
+    monkeypatch.setattr(rs.ib, "build_check",
+                        lambda text, entry, **kw: (False, "build service unavailable: ReadTimeout: timed out"))
+    out = reg.invoke("completed", "{}")
+    assert "VERIFIER UNAVAILABLE" in out and "verifier unavailable" in out
+    assert "VERIFY FAILED" not in out and "Fix what it reported" not in out
+    assert at.failed_completions == 0 and at.verifier_unavailable == 1 and at.kind is None
+
+
+def test_write_after_pass_is_refused_and_verified_bytes_kept(tmp_path, monkeypatch):
+    """Audit F1: DeepSeek batches tool calls, so a write_file can follow a
+    passing completed() in the same turn. The file is frozen from the PASS on
+    and the bytes that passed are kept as verified.thy."""
+    at, b, reg = make(tmp_path)
+    rs._register_finishing_tools(reg, at)
+    monkeypatch.setattr(rs.ib, "build_check", lambda text, entry, **kw: (True, "ok"))
+    proved = THY.replace("sorry", "by simp")
+    at.thy.write_text(proved)
+    assert "VERIFY PASSED" in reg.invoke("completed", "{}")
+    assert (tmp_path / "verified.thy").read_text() == proved
+    out = reg.invoke("write_file", json.dumps({"content": THY}))
+    assert "frozen" in out and "NOT applied" in out
+    assert at.thy.read_text() == proved and at.writes == 0
+    assert "run is over" in reg.invoke("write_disproof", json.dumps({"content": "theory X imports Main begin end"}))
+
+
+def test_disproved_requires_a_built_disproof(tmp_path, monkeypatch):
+    """Audit F7: a disproof that did not build (or was never built through
+    write_disproof) cannot end the run."""
+    at, b, reg = make(tmp_path)
+    rs._register_finishing_tools(reg, at)
+    (tmp_path / "DISPROOF.thy").write_text("theory DISPROOF imports Main begin lemma False sorry end")
+    out = reg.invoke("disproved", json.dumps({"explanation": "x"}))
+    assert "never run" in out and at.kind is None
+    monkeypatch.setattr(rs.ib, "build_check", lambda text, entry, **kw: (False, "boom"))
+    assert "FAILED" in reg.invoke("write_disproof", json.dumps({"content": "theory DISPROOF imports Main begin end"}))
+    out = reg.invoke("disproved", json.dumps({"explanation": "x"}))
+    assert "FAILED" in out and at.kind is None
+    monkeypatch.setattr(rs.ib, "build_check", lambda text, entry, **kw: (True, "ok"))
+    assert "Build: OK" in reg.invoke("write_disproof", json.dumps({"content": "theory DISPROOF imports Main begin end"}))
+    monkeypatch.setattr(rs, "DEFECTS_DIR", tmp_path / "defects")
+    out = reg.invoke("disproved", json.dumps({"explanation": "x"}))
+    assert "recorded" in out and at.kind == "disproved"
+
+
+def test_final_verify_skips_the_build_on_a_stuck_file(tmp_path, monkeypatch):
+    """Audit F3: after a timeout the harness's own verdict must not build a
+    file the session never finished checking; and once completed() passed,
+    the verdict is taken on verified.thy."""
+    at, b, reg = make(tmp_path)
+    built = []
+    monkeypatch.setattr(rs.ib, "build_check", lambda text, entry, **kw: built.append(text) or (True, "ok"))
+    at.thy.write_text(THY.replace("sorry", "by simp"))
+    b.sync = {"synced": True, "success": False, "error": "timed out (still running at line 5)", "stuck_line": 5}
+    ok, report = rs._final_verify(at, ENTRY, "wsolution")
+    assert not ok and "still running line 5" in report and not built
+    b.sync = {"synced": True, "success": True, "error": None, "stuck_line": None}
+    ok, report = rs._final_verify(at, ENTRY, "wsolution")
+    assert ok and len(built) == 1
+    # a sorry-laden file fails on the textual checks before any session call
+    at.thy.write_text(THY)
+    calls_before = len(b.calls)
+    ok, report = rs._final_verify(at, ENTRY, "wsolution")
+    assert not ok and "sorry" in report and len(b.calls) == calls_before
+    # verified bytes win over whatever is on disk afterwards
+    (tmp_path / "verified.thy").write_text(THY.replace("sorry", "by simp"))
+    ok, report = rs._final_verify(at, ENTRY, "wsolution")
+    assert ok and built[-1] == THY.replace("sorry", "by simp")
+
+
+def test_harness_mcp_calls_are_in_the_transcript(tmp_path):
+    """Audit F6: the prover side of the conversation (sync report,
+    diagnostics) is recorded as `mcp` records in the same transcript."""
+    at, b, reg = make(tmp_path)
+    recs = []
+    agentlib.TOOL_SINK = recs.append
+    try:
+        reg.invoke("write_file", json.dumps({"content": THY}))
+    finally:
+        agentlib.TOOL_SINK = None
+    kinds = [(r["kind"], r["name"]) for r in recs]
+    assert ("mcp", "isabelle_sync") in kinds and ("mcp", "isabelle_diagnostic_messages") in kinds
+    rec = next(r for r in recs if r["name"] == "isabelle_diagnostic_messages")
+    assert json.loads(rec["arguments"]) == {"severity": "error"} and "messages" in rec["result"]

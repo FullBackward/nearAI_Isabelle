@@ -65,7 +65,8 @@ What `verify` checks (the Isabelle counterpart of upstream's verify.sh)
     type unchanged and `undefined` replaced.
 
 Environment: IB_MANIFEST, IB_QUEUE, IB_GYM_URL (default http://localhost:8000),
-IB_BUILD_TIMEOUT (seconds, default 900).
+IB_BUILD_TIMEOUT (seconds, default 1800; a 35 kB proof file with a few metis
+calls took the Q1 rerun past 900).
 """
 from __future__ import annotations
 
@@ -86,7 +87,7 @@ MANIFEST = HERE / "manifest.json"
 QUEUE = HERE / "problems.tsv"
 
 GYM_URL = os.environ.get("IB_GYM_URL", "http://localhost:8000")
-BUILD_TIMEOUT = float(os.environ.get("IB_BUILD_TIMEOUT", "900"))
+BUILD_TIMEOUT = float(os.environ.get("IB_BUILD_TIMEOUT", "1800"))
 BUILD_WAIT_S = float(os.environ.get("IB_BUILD_WAIT_S", "900"))        # waiting out a 503 memory gate
 BUILD_WAIT_POLL_S = float(os.environ.get("IB_BUILD_WAIT_POLL_S", "30"))
 
@@ -358,6 +359,10 @@ FORBIDDEN = [
     (r"^\s*(nitpick_params|sledgehammer_params)\b", "params"),
     (r"^\s*(instance|instantiation|interpretation|global_interpretation|sublocale)\b.*\bsorry\b", "sorry in instance"),
     (r"^\s*(theory|end)\b.*\n.*^\s*theory\b", "second theory header"),
+    # ML inside a proof method: `by (tactic \<open>...\<close>)` reaches
+    # Skip_Proof.make_thm (the oracle behind sorry) with no quick_and_dirty
+    # check, and a cold build records the oracle and passes. Audit F2.
+    (r"\b(raw_)?tactic\s*(\\<open>|\u2039|\")", "tactic (ML inside a proof method)"),
 ]
 
 DEFINES_RE = re.compile(
@@ -701,7 +706,8 @@ def textual_checks(text: str, entry: dict, variant: str) -> list[str]:
     fails: list[str] = []
     clean = strip_comments(text)
 
-    if re.search(r"\b(sorry|oops)\b", clean):
+    # \<proof> is Isabelle's synonym for sorry (the build rejects it too)
+    if re.search(r"\b(sorry|oops)\b|\\<proof>", clean):
         fails.append("file still contains sorry/oops")
     for pat, label in FORBIDDEN:
         if re.search(pat, clean, re.MULTILINE):
@@ -844,6 +850,10 @@ def verify_text(text: str, entry: dict, variant: str, *, build: bool = True,
     ok, log = build_check(text, entry, timeout=timeout, gym_url=gym_url)
     if ok:
         return True, f"PASS [{name}] theory builds; statement frozen; no sorry/escape hatches."
+    if log.startswith("build service unavailable"):
+        # Not a verdict: the build never ran (or never answered). Named so the
+        # harness and the results file can tell it from a failing proof.
+        return False, f"{log}\n\nFAIL [{name}] verifier unavailable: the theory was not judged"
     return False, f"isabelle build output:\n{log}\n\nFAIL [{name}] the theory does not build"
 
 
@@ -1106,6 +1116,14 @@ def cmd_selftest(args) -> int:
         check(any("header" in x for x in textual_checks(bad, e, "wsolution")), "import change is caught")
         bad = good.replace("by simp", "by (metis add_2_eq_Suc) (* sorry *)")
         check(textual_checks(bad, e, "wsolution") == [], "sorry inside a comment is fine")
+        bad = good.replace("by simp", "by (tactic \\<open>ALLGOALS (K no_tac)\\<close>)")
+        check(any("tactic" in x for x in textual_checks(bad, e, "wsolution")), "tactic method (ML in a proof) is caught")
+        bad = good.replace("by simp", "by (raw_tactic \u2039no_tac\u203a)")
+        check(any("tactic" in x for x in textual_checks(bad, e, "wsolution")), "raw_tactic with a cartouche is caught")
+        bad = good.replace("by simp", "\\<proof>")
+        check(any("sorry" in x for x in textual_checks(bad, e, "wsolution")), "the \\<proof> placeholder is caught")
+        bad = good.replace("by simp", "by (simp add: tactic_def)")
+        check(textual_checks(bad, e, "wsolution") == [], "a fact named tactic_def is not a tactic call")
         # full variant
         fg = f.replace("undefined", "5").replace("  sorry\n", "  using assms unfolding synth_1_solution_def by simp\n")
         check(textual_checks(fg, e, "full") == [], "full variant with answer passes")

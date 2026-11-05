@@ -22,7 +22,15 @@ docs/experiment-design.md the design and open decisions.
   write `transcript.jsonl` + `transcript.md` into the bench dir (`_Transcript`,
   `_render_transcript_md`) and append `runs/results.jsonl`. `_Attempt.mcp` absorbs server capacity
   refusals (release idle scratch sessions, wait, retry); results and tool descriptions that name the hidden
-  memory/heap tools are rewritten. The solver rule lives in `extract_solver_calls` /
+  memory/heap tools are rewritten. `_Attempt.diagnostics` asks `isabelle_sync` first: a session check
+  that hit its budget (`IB_LOAD_TIMEOUT`) is an error naming the running line, and `completed()`
+  refuses to build such a file; a build service that does not answer is a `verifier unavailable`
+  outage, not a failed completion. A passing `completed()` writes `verified.thy` and freezes
+  `write_file`; `_final_verify` (run before the session is closed) judges those bytes, and never
+  builds a file the session is still running. Every MCP call the harness makes is an `mcp`
+  record in `transcript.jsonl`. The solver rule deliberately does NOT bind a sledgehammer
+  result to the goal it was found for (owner decision, 2026-11-05: metis transplants are a finding,
+  see docs/experiment-design.md). The solver rule lives in `extract_solver_calls` /
   `sanctioned_from_output`; the skeleton arm's automatic fill in `_auto_fill`.
 - `harness/arms.py` -- the only place arms differ: `mcp_tools`, `auto_fill`, `strategy`.
 - `harness/ib.py` -- manifest (`prepare`), staging (proof stripping via `sorryfy` /
