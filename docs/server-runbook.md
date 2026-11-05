@@ -123,12 +123,17 @@ campaigns; ask before relying on it.)
 
 ## 2. This repository on the server
 
-Clone it once it is committed; until then rsync from the laptop:
+All copies go through git: commit on the laptop, push, pull on the server.
+`.gitignore` keeps `config/model.json`, `runs/`, `db.sql`, `.venv/` and
+`benchmarks/` out, so a pull never touches the key, the results or the venv.
 
 ```bash
-rsync -av --exclude .venv --exclude runs --exclude benchmarks \
-      --exclude 'config/model.json' --exclude db.sql --exclude '__pycache__' \
-      ~/GitHub/nearAI_Isabelle/ user@server:~/GitHub/nearAI_Isabelle/
+# laptop
+git push origin main
+# server, first time
+git clone git@github.com:FullBackward/nearAI_Isabelle.git ~/nearAI_Isabelle
+# server, every later update (agentlib.py / run_isabelle_solver.py changes need no reinstall)
+cd ~/nearAI_Isabelle && git pull
 ```
 
 On the server:
@@ -238,9 +243,14 @@ echo $!                                                                         
 Watch it:
 
 ```bash
-tail -f runs/q1_plain_rep0.log                      # harness lines: opened, tool calls, nudges, verdict
-ls -la runs/plain/imo_2026_p1/rep0/                 # the model's file, transcript.jsonl (grows live)
-tail -1 runs/results.jsonl | python3 -m json.tool   # the result row, once it is over
+T=runs/plain/imo_2026_p1/rep0/transcript.jsonl
+.venv/bin/python scripts/transcript_view.py $T --summary        # one line per model call / tool call so far
+.venv/bin/python scripts/transcript_view.py $T --last 3         # the last few, with reasoning and tool results
+.venv/bin/python scripts/transcript_view.py $T --follow         # keep printing as the attempt goes on (Ctrl-C to stop)
+.venv/bin/python scripts/transcript_view.py $T --full | less    # everything, untruncated
+cat runs/plain/imo_2026_p1/rep0/imo_2026_p1.thy                 # the file as the model has it right now
+tail -f runs/q1_plain_rep0.log                                  # harness lines: opened, nudges, verdict
+tail -1 runs/results.jsonl | python3 -m json.tool               # the result row, once it is over
 ```
 
 What the attempt leaves in `runs/plain/imo_2026_p1/rep0/`:
@@ -293,9 +303,26 @@ and start the worker again.
 
 ```bash
 .venv/bin/python analyze.py --pair plain skeleton --source imo2026
-# laptop:
-rsync -av user@server:~/GitHub/nearAI_Isabelle/runs/ ~/GitHub/nearAI_Isabelle/runs-server/
 ```
+
+Results travel by git too. `runs/` is ignored on purpose (it holds every
+attempt's working files), so put the pieces worth keeping on a results branch
+with a forced add, and pull that branch on the laptop:
+
+```bash
+# server
+git checkout -b results-$(date +%F)
+git add -f runs/results.jsonl runs/*/imo_2026_p*/rep*/transcript.jsonl \
+           runs/*/imo_2026_p*/rep*/transcript.md runs/*/imo_2026_p*/rep*/*.thy runs/*.log
+git commit -m "results: IMO 2026 attempts $(date +%F)"
+git push -u origin HEAD
+git checkout main
+# laptop
+git fetch && git checkout results-<date>
+```
+
+Never add `config/model.json` or `db.sql`; the ignore rules refuse them without
+`-f`, and the forced add above names only the result files.
 
 `runs/results.jsonl` has one row per attempt (status, steps, tokens, fills, wall
 time, verifier report, `transcript` path); `runs/<arm>/<problem>/rep<N>/` the final

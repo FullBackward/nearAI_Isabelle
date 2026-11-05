@@ -42,6 +42,7 @@ the benchmark choice and the open decisions.
 | `harness/mcp_bridge.py` | sync wrapper over one MCP stdio server (agentlib is synchronous) |
 | `scripts/statement_probe.py` | LLM-free pass: does the statement parse under Isabelle2026, does bare sledgehammer already close it |
 | `scripts/bigstep_check.py` | LLM-free, session-free: does a statement file build through the server's bigstep endpoint (quick_and_dirty injected so `sorry` is tolerated) |
+| `scripts/transcript_view.py` | readable, live view of an attempt's `transcript.jsonl` (`--summary`, `--last N`, `--follow`, `--full`) |
 | `problems/imo2026/` | the six IMO 2026 problems: `isabelle/` our Isabelle/HOL statements (see its README), `lean/` the AxiomMath Lean statements they translate |
 | `analyze.py` | per-arm / per-category tables, paired per-problem comparison with McNemar |
 | `benchmarks/` | (gitignored) miniF2F and PutnamBench checkouts |
