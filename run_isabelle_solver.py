@@ -624,7 +624,7 @@ def _register_finishing_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
             at.last_verify = report
             return (report + "\n\nVERIFY FAILED. You are NOT done. That step does not terminate "
                     "(or is far too slow): replace it with a different proof and call completed() again.")
-        ok, report = ib.verify_text(text, at.entry, at.variant, gym_url=GYM_URL)
+        ok, report = _safe_verify(text, at.entry, at.variant, gym_url=GYM_URL)
         at.last_verify = report
         if ok:
             at.kind = "completed"
@@ -1023,6 +1023,17 @@ OPEN_RETRIES = 8
 OPEN_RETRY_S = 60.0
 
 
+def _safe_verify(text: str, entry: dict, variant: str, **kw) -> tuple[bool, str]:
+    """verify_text that cannot take the worker down. The checks are written
+    to report, not raise, but a verdict site is the wrong place to find the
+    exception that proves otherwise (P2 plain, 2026-11-08: the worker died
+    after the agent loop on a file with no closing `end`, no results row)."""
+    try:
+        return ib.verify_text(text, entry, variant, **kw)
+    except Exception as e:                               # noqa: BLE001
+        return False, f"FAIL [{entry['name']}] verifier error: {type(e).__name__}: {e}"
+
+
 def _final_verify(at: _Attempt, entry: dict, variant: str) -> tuple[bool, str]:
     """The harness's own verdict on an attempt, taken while its session is
     still up. Judged on the bytes completed() verified (verified.thy) when
@@ -1039,7 +1050,7 @@ def _final_verify(at: _Attempt, entry: dict, variant: str) -> tuple[bool, str]:
         text = ""
     if not text.strip():
         return False, "no file"
-    ok, report = ib.verify_text(text, entry, variant, build=False, gym_url=GYM_URL)
+    ok, report = _safe_verify(text, entry, variant, build=False, gym_url=GYM_URL)
     if not ok:
         return ok, report
     if not snap.exists():
@@ -1050,7 +1061,7 @@ def _final_verify(at: _Attempt, entry: dict, variant: str) -> tuple[bool, str]:
         if stuck is not None:
             return False, (f"FAIL [{entry['name']}] the prover never finished checking the file: "
                            f"still running line {stuck}: `{at.line_text(stuck)}`. Not built.")
-    return ib.verify_text(text, entry, variant, gym_url=GYM_URL)
+    return _safe_verify(text, entry, variant, gym_url=GYM_URL)
 
 
 def _open_with_retries(bridge: MCPBridge, thy: Path) -> str:
@@ -1190,7 +1201,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
 
     if final is None:   # the session never came up: judge the file blind
         text = (bench_dir / f"{problem}.thy").read_text(encoding="utf-8") if (bench_dir / f"{problem}.thy").exists() else ""
-        final = (ib.verify_text(text, entry, variant, gym_url=GYM_URL) if text else (False, "no file"))
+        final = (_safe_verify(text, entry, variant, gym_url=GYM_URL) if text else (False, "no file"))
     passed, report = final
     reason = next((l.strip() for l in reversed(report.splitlines()) if l.strip().startswith("FAIL [")), "")
     if not reason and not passed:
@@ -1321,9 +1332,18 @@ def main() -> int:
                                            status="todo", steps=None, note="interrupted"))
             raise
         except Exception as e:                           # noqa: BLE001
+            # One row's harness error must not end the pass: mark the row,
+            # keep the traceback in the log, go on to the next row. (The
+            # P2 plain crash of 2026-11-08 stopped a ten-attempt pass at its
+            # first row.) A persistent error fails rows in seconds, which the
+            # queue notes show.
+            import traceback
+            traceback.print_exc()
+            print(f"[harness] ERROR on {problem}/{arm}/rep{rep}: {type(e).__name__}: {e}; continuing", flush=True)
             ib.cmd_release(SimpleNamespace(problem=problem, arm=arm, rep=rep, variant=variant,
                                            status="failed", steps=None, note=f"harness error: {e}"[:120]))
-            raise
+            n_done += 1
+            continue
         ib.cmd_release(SimpleNamespace(problem=problem, arm=arm, rep=rep, variant=variant, status=status,
                                        steps=getattr(_solve_one, "last_steps", None),
                                        note=getattr(_solve_one, "last_note", "")))

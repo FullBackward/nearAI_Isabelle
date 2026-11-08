@@ -490,3 +490,22 @@ def test_leaf_rejection_lists_every_line(tmp_path):
     out = reg.invoke("write_file", json.dumps({"content": text}))
     assert out.startswith("REJECTED") and "40 offending" in out and "more" not in out
     assert len(leaves.check(text, set())) == 40 and out.count("-- method") == 40
+
+
+def test_textual_checks_report_a_missing_end_instead_of_raising():
+    """P2 plain 2026-11-08: the worker died in _final_verify on a multi-target
+    file with no closing `end`. A broken file is a FAIL, not an exception."""
+    entry = dict(ENTRY, source="imo2026", targets=["t1"], header="t1 imports Main")
+    broken = 'theory t1 imports Main\nbegin\n\ntheorem t1: shows "True"\n  by simp\n'
+    fails = rs.ib.textual_checks(broken, entry, "wsolution")
+    assert fails and any("closing `end`" in f for f in fails)
+    ok, report = rs._safe_verify(broken, entry, "wsolution", build=False)
+    assert not ok and report.startswith("FAIL [t1]")
+
+
+def test_final_verify_never_raises(tmp_path, monkeypatch):
+    at, b, reg = make(tmp_path)
+    monkeypatch.setattr(rs.ib, "verify_text", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    at.thy.write_text(THY.replace("sorry", "by simp"))
+    ok, report = rs._final_verify(at, ENTRY, "wsolution")
+    assert not ok and "verifier error: RuntimeError: boom" in report

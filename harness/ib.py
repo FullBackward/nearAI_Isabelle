@@ -719,7 +719,14 @@ def textual_checks(text: str, entry: dict, variant: str) -> list[str]:
         fails.append(f"cannot parse theory header: {ex}")
         return fails
     if entry.get("targets"):
-        return fails + _multi_target_checks(text, clean, entry)
+        # A file without a closing `end` (or with the target renamed away)
+        # is a FAILED file, not a harness crash: P2 plain, 2026-11-08, killed
+        # the worker from _final_verify with "theory has no closing `end`".
+        try:
+            return fails + _multi_target_checks(text, clean, entry)
+        except ValueError as ex:
+            fails.append(str(ex))
+            return fails
     try:
         tname, a, b, _ = locate_statement(text, entry["theorem_name"])
     except ValueError as ex:
