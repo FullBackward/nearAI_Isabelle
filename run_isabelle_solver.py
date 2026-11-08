@@ -66,7 +66,17 @@ GYM_URL = os.environ.get("IB_GYM_URL", "http://localhost:8000")
 MCP_PYTHON = os.environ.get("IPS_MCP_PYTHON", sys.executable)
 
 FILL_TIMEOUT_S = 30           # sledgehammer budget per `sorry`
-FILL_MAX_TOTAL_S = 600        # per fill job
+FILL_MAX_TOTAL_S = 600        # per fill job (floor; the automatic round scales with the sorry count)
+FILL_MAX_TOTAL_CEIL_S = 1800  # ceiling of the scaled automatic round
+FILL_S_PER_SORRY = 10         # Q1 forced run 2026-11-05: 223 sorries in 600 s left 94 untouched
+
+
+def auto_fill_budget(n_sorries: int) -> int:
+    """Job cap of the automatic fill round: 10 s per sorry, between the
+    600 s floor and the 1800 s ceiling. The first forced Q1 round proved 127
+    of 223 sorries and hit the 600 s cap with 94 skipped; the model then had
+    to notice and re-run the explicit tool with a bigger budget by itself."""
+    return max(FILL_MAX_TOTAL_S, min(FILL_MAX_TOTAL_CEIL_S, FILL_S_PER_SORRY * n_sorries))
 FILL_PATIENCE_S = 240         # the MCP returns `continuing` after this
 ATTEMPT_TIMEOUT_S = 180       # multi_attempt / run_code per candidate
 # Wall budget for the session's check of the whole file after a write. The
@@ -467,13 +477,13 @@ def _register_file_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
         write_file)
 
 
-def _collect_fill(at: _Attempt, first: str) -> dict:
+def _collect_fill(at: _Attempt, first: str, max_total_s: int = FILL_MAX_TOTAL_S) -> dict:
     """Wait for a fill job that returned `continuing: true`."""
     try:
         d = json.loads(first)
     except (TypeError, ValueError):
         return {"raw": first}
-    deadline = time.time() + FILL_MAX_TOTAL_S + 120
+    deadline = time.time() + max_total_s + 120
     while isinstance(d, dict) and d.get("continuing") and time.time() < deadline:
         time.sleep(5)
         raw = at.mcp("isabelle_fill_status", {})
@@ -506,9 +516,11 @@ def _auto_fill(at: _Attempt) -> str:
     at.auto_fills += 1
     at.fills += 1
     at.count("auto:isabelle_fill_sorries")
-    raw = at.mcp("isabelle_fill_sorries", {"timeout_s": FILL_TIMEOUT_S, "max_total_s": FILL_MAX_TOTAL_S,
+    n_sorries = len(re.findall(r"\bsorry\b", ib.strip_comments(at.thy.read_text(encoding="utf-8"))))
+    budget = auto_fill_budget(n_sorries)
+    raw = at.mcp("isabelle_fill_sorries", {"timeout_s": FILL_TIMEOUT_S, "max_total_s": budget,
                                           "patience_s": FILL_PATIENCE_S})
-    d = _collect_fill(at, raw)
+    d = _collect_fill(at, raw, budget)
     summary = _fill_summary(at, d)
     patched = d.get("patched_text") if isinstance(d, dict) else None
     if isinstance(patched, str) and patched.strip() and d.get("filled"):
@@ -555,8 +567,10 @@ def _register_mcp_tools(reg: agentlib.ToolRegistry, at: _Attempt, available: lis
             desc = re.sub(r"\s*heap_session runs it in that heap's import context\.", "", desc)
         if name == "isabelle_fill_sorries" and at.arm.auto_fill:
             desc = ("Re-run the server-side sledgehammer on every `sorry` of the file "
-                    "(write_file already does this automatically; call this to retry with a "
-                    f"larger timeout_s than the default {FILL_TIMEOUT_S}). " + desc)
+                    "(write_file already does this automatically with "
+                    f"timeout_s={FILL_TIMEOUT_S} per sorry and a job cap of {FILL_S_PER_SORRY} s "
+                    f"per sorry between {FILL_MAX_TOTAL_S} and {FILL_MAX_TOTAL_CEIL_S} s; call this to retry "
+                    "the survivors with a larger timeout_s / max_total_s). " + desc)
 
         def make(n: str):
             def fn(**kwargs):

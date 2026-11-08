@@ -239,10 +239,13 @@ def check(text: str, allowed: set[Key]) -> list[Violation]:
     return out
 
 
-def summarize(bad: list[Violation], limit: int = 8) -> str:
-    lines = [f"  line {v.line}: `{v.text[:110]}` -- {v.reason}" for v in bad[:limit]]
-    if len(bad) > limit:
-        lines.append(f"  ... and {len(bad) - limit} more")
+def summarize(bad: list[Violation], limit: int | None = None) -> str:
+    """Every offending line (the Q1 forced run's one rejection had 33; a cut
+    list costs the model a round trip per 8 lines)."""
+    shown = bad if limit is None else bad[:limit]
+    lines = [f"  line {v.line}: `{v.text[:110]}` -- {v.reason}" for v in shown]
+    if len(bad) > len(shown):
+        lines.append(f"  ... and {len(bad) - len(shown)} more")
     return "\n".join(lines)
 
 

@@ -327,6 +327,36 @@ A worker that dies leaves its rows `claimed`; put them back with
 `harness/ib.py requeue claimed` (one row: `harness/ib.py release <problem> --arm A --rep R --status todo`)
 and start the worker again.
 
+### 5b. The rest of IMO 2026: one pass, then repeats
+
+`scripts/imo2026_pass.py` drives the comparison in two stages on the server;
+it only wraps the queue and the worker, so attempts are exactly as in 5a.
+
+```bash
+cd ~/nearAI_Isabelle && source .venv/bin/activate && export ISABELLE_POOL_SERVER=~/Isabelle-Pool-Server
+git pull && .venv/bin/python -m pytest -q tests && .venv/bin/python harness/leaves.py
+curl -s localhost:8000/healthz && pgrep -af 'run_isabelle_solver|poly' || echo "no leftovers"
+
+# stage 1: every problem once on each arm (P1 rows are settled from results.jsonl, not re-run)
+.venv/bin/python scripts/imo2026_pass.py init
+.venv/bin/python scripts/imo2026_pass.py launch          # paid: one worker, --loop 0, 4 h per attempt
+.venv/bin/python scripts/imo2026_pass.py status          # any time; the worker log is runs/imo-<stamp>.log
+.venv/bin/python scripts/transcript_view.py runs/<arm>/<problem>/rep0/transcript.jsonl --follow --summary
+
+# when the queue shows no todo/running rows:
+.venv/bin/python scripts/imo2026_pass.py report          # table + recommendation + subsets/imo2026_repeat.txt
+
+# stage 2 (if the report says so):
+.venv/bin/python scripts/imo2026_pass.py repeat 3        # or `repeat 3 --all`
+.venv/bin/python scripts/imo2026_pass.py launch
+```
+
+Ten attempts at one to two hours each: expect stage 1 to take most of a day.
+If the worker dies (server reboot, OOM), `launch` again: the queue reaps the
+dead claim and the worker continues from the next todo row. Kill with
+`pkill -f run_isabelle_solver` and clean up `poly` as in 5a if a build was
+in flight.
+
 ## 6. Results
 
 ```bash

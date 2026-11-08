@@ -468,3 +468,25 @@ def test_leaf_rule_is_off_in_the_other_arms(tmp_path):
 def test_leaves_selftest():
     from harness import leaves
     leaves.selftest()
+
+
+def test_auto_fill_budget_scales_with_the_sorry_count(tmp_path):
+    """Q1 forced run 2026-11-05: 223 sorries hit the 600 s job cap with 94
+    untouched. The automatic round now gets 10 s per sorry, 600..1800 s."""
+    assert rs.auto_fill_budget(5) == 600 and rs.auto_fill_budget(100) == 1000 and rs.auto_fill_budget(500) == 1800
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    many = THY.replace('theorem t1: shows "True"\n  sorry',
+                       "".join(f'lemma l{i}: "True"\n  sorry\n' for i in range(70)) + 'theorem t1: shows "True"\n  sorry')
+    reg.invoke("write_file", json.dumps({"content": many}))
+    fill_args = [a for n, a in b.calls if n == "isabelle_fill_sorries"]
+    assert fill_args and fill_args[-1]["max_total_s"] == 710 and fill_args[-1]["timeout_s"] == rs.FILL_TIMEOUT_S
+
+
+def test_leaf_rejection_lists_every_line(tmp_path):
+    from harness import leaves
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    text = THY.replace('theorem t1: shows "True"\n  sorry',
+                       "".join(f'lemma l{i}: "True"\n  by simp\n' for i in range(40)) + 'theorem t1: shows "True"\n  sorry')
+    out = reg.invoke("write_file", json.dumps({"content": text}))
+    assert out.startswith("REJECTED") and "40 offending" in out and "more" not in out
+    assert len(leaves.check(text, set())) == 40 and out.count("-- method") == 40

@@ -230,6 +230,21 @@ its first `completed()`; the file it submitted (854 lines, 3 metis calls, no
   the failed first run -- one transplanted metis made the difference, which
   says as much about variance as about the arms. It also showed the plain
   arm's treatment is optional, hence `skeleton_forced`.
+- **Q1 skeleton_forced, first run (2026-11-05, ~08:30-10:15 UTC): SOLVED.**
+  177 model calls, 104 min wall clock (47 min model, 57 min tools), 10 writes
+  of which 1 rejected by the leaf rule (first write: 33 hand closers; the
+  model complied from then on), 776-line proof with 228 leaves -- every one
+  of them written by the filler (re-audited from the transcript: 0 leaves
+  outside the reconstructed filler keys). Fill rounds: auto 127/223 (hit the
+  600 s job cap, 94 skipped), explicit `isabelle_fill_sorries(timeout_s=60,
+  max_total_s=1200)` 91/96, then 0/5, 10/11, 3/3 after the model split the
+  survivors. Final file: 62 metis + 15 satx + 31 presburger + 49 simp + ...,
+  all bound to the statement they were found for; `completed()` built in 8 s,
+  identical bytes rebuild locally. Costs of the arm: 59 `isabelle_multi_attempt`
+  calls (29 min, 21/53 candidates succeeded) spent testing closers in scratch
+  that the file could not carry, and the first auto-fill's 600 s cap, which
+  the model worked around with the explicit tool. Versus plain (71 min, 1209
+  lines, 338 hand leaves, 0 ATP): slower, shorter proof, same verdict.
 - **Harness: a failed (not timed-out) check was reported as "still running
   line False".** The LSP MCP computes `stuck_line` as `timed_out and commands
   and next(...)`, so a plain failure returns `False`; `isinstance(False,

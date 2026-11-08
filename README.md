@@ -108,8 +108,12 @@ for i in 1 2; do nohup .venv/bin/python run_isabelle_solver.py --loop 0 > runs/w
 # results
 .venv/bin/python analyze.py --pair plain skeleton
 
-# the IMO 2026 tier: all six problems, both arms, 3 repeats each
-.venv/bin/python harness/ib.py queue-init --source imo2026 --arm plain skeleton --repeats 3
+# the IMO 2026 tier, in passes (scripts/imo2026_pass.py wraps the queue + one worker):
+.venv/bin/python scripts/imo2026_pass.py init       # rep 0 of all six on plain + skeleton_forced; hand-run attempts are settled from results.jsonl
+.venv/bin/python scripts/imo2026_pass.py launch     # one detached worker drains the queue (paid)
+.venv/bin/python scripts/imo2026_pass.py status
+.venv/bin/python scripts/imo2026_pass.py report     # per-problem table, discordant pairs, which problems to repeat
+.venv/bin/python scripts/imo2026_pass.py repeat 3   # reps 1..2 of the recommended subset (or --all), then launch again
 ```
 
 Budgets follow upstream: no step cap, wall clock only (`--timeout 14400`, 4 h per
