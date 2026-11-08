@@ -148,6 +148,21 @@ def cmd_repeat(args) -> int:
     return 0
 
 
+def model_config_ok() -> str:
+    """Load config/model.json the way the worker does (agentlib.load_config
+    reads `apikey_file`), so a missing or empty key file fails here, before a
+    queue row is claimed -- and without ever printing the key."""
+    import agentlib  # noqa: WPS433
+    cfg_path = ROOT / "config" / "model.json"
+    if not cfg_path.exists():
+        return f"MISSING {cfg_path} (copy config/model.example.json)"
+    try:
+        cfg = agentlib.load_config(cfg_path)
+    except Exception as e:  # noqa: BLE001
+        return f"BAD ({type(e).__name__}: {e})"
+    return f"ok: {cfg.model} @ {cfg.host} (key read from file, {len(cfg.apikey)} chars)"
+
+
 def cmd_launch(args) -> int:
     alive = worker_alive()
     if alive and not args.force:
@@ -155,9 +170,14 @@ def cmd_launch(args) -> int:
         return 1
     health = ips_health()
     print(f"IPS {IPS_URL}/healthz: {health}")
-    if not health.startswith("200"):
-        print("refusing to launch: the Pool Server is not answering")
+    model = model_config_ok()
+    print(f"model config: {model}")
+    if not health.startswith("200") or not model.startswith("ok"):
+        print("refusing to launch: fix the above first")
         return 1
+    if args.dry_run:
+        print("dry run: checks passed, no worker started")
+        return 0
     logs = ROOT / "runs"
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"{args.owner}.log"
@@ -185,6 +205,7 @@ def _cell(r: dict | None) -> str:
 
 def cmd_status(args) -> int:
     print(f"IPS: {ips_health()}")
+    print(f"model config: {model_config_ok()}")
     alive = worker_alive()
     print("worker: " + ("; ".join(alive) if alive else "none running"))
     queue_status()
@@ -281,6 +302,7 @@ def main() -> int:
     s.add_argument("--timeout", type=int, default=14400)
     s.add_argument("--arms-only", nargs="*", default=None, help="claim only these arms")
     s.add_argument("--force", action="store_true")
+    s.add_argument("--dry-run", action="store_true", help="run the checks, start nothing")
     s.set_defaults(fn=cmd_launch)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("report", help="per-problem table and the repeat recommendation")
