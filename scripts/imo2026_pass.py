@@ -305,7 +305,8 @@ def cmd_report(args) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--results", default=str(RESULTS))
-    p.add_argument("--arms", nargs="+", default=ARMS_DEFAULT)
+    p.add_argument("--arms", default=",".join(ARMS_DEFAULT), type=lambda v: [a for a in v.replace(" ", ",").split(",") if a],
+                   help="comma-separated arms (default: %(default)s); a list would swallow the subcommand")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("init", help="queue rep 0 of every problem on each arm; settle rows already in results.jsonl")
     s.set_defaults(fn=cmd_init)
