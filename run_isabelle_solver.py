@@ -1373,6 +1373,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
         "arm": arm_name, "variant": variant, "rep": rep, "model": cfg.model,
         "solved": passed, "status": status,
         "finish_reason": getattr(result, "finish_reason", None), "timed_out": timed_out,
+        "timeout_s": args.timeout, "max_steps": args.max_steps,   # the budget the attempt ran under
         "steps": getattr(result, "num_steps", None), "trajectory_id": getattr(result, "trajectory_id", None),
         "elapsed_s": round(elapsed, 1), "started": started.isoformat(), "ended": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "verify": reason if not passed else "PASS",

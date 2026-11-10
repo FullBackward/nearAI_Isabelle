@@ -204,7 +204,8 @@ def _cell(r: dict | None) -> str:
     if r is None:
         return "-"
     s = {"solved": "SOLVED", "failed": "failed", "timeout": "timeout", "gave_up": "gave up", "disproved": "disproved"}.get(r["status"], r["status"])
-    return f"{s} {r.get('elapsed_s', 0) / 60:.0f}m"
+    budget = f"/{int(r['timeout_s']) // 3600}h" if r.get("timeout_s") else ""
+    return f"{s} {r.get('elapsed_s', 0) / 60:.0f}m{budget}"
 
 
 def cmd_stop(args) -> int:
