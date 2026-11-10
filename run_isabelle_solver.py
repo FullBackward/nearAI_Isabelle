@@ -478,7 +478,11 @@ def _register_file_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
                         "closing proof method yourself; every leaf is `sorry` until the filler proves "
                         "it, and filler-proved lines are kept verbatim under the same statement. "
                         f"{len(bad)} offending line(s):\n" + leaves.summarize(bad) +
-                        "\nPut `sorry` on those steps (with the `using` facts they need) and write again.")
+                        "\nPut `sorry` back on those steps and write again. If the filler already failed on a "
+                        "step, writing the closer yourself is not the move: RESTATE the step so the filler "
+                        "can -- split it into two or three smaller `have`s, give it the facts it needs with "
+                        "`using`, or prove a helper lemma above the theorem and use it. Test a candidate "
+                        "decomposition in scratch (isabelle_run_code / isabelle_multi_attempt) if unsure.")
         # The frozen parts (header, definition blocks, theorem statements) are
         # the verifier's rule; checking them only at completed() let the forced
         # P2 run (2026-11-09) spend its last two hours on a 15-line scratch file
@@ -570,6 +574,13 @@ def _fill_summary(at: _Attempt, d: dict) -> str:
         lines.append(head)
         if r.get("outcome") not in ("proved",) and r.get("goal"):
             lines.append(f"      goal: {str(r['goal'])[:200]}")
+    open_rows = [r for r in res if r.get("outcome") not in ("proved", "false")]
+    if open_rows and at.arm.filler_only:
+        lines.append("  NEXT: the filler could not close the step(s) above AS STATED, and you may not write "
+                     "their closers yourself. Restate them: split each into smaller `have`s (one fact per "
+                     "step), add the facts they need with `using`/`unfolding`, state the intermediate "
+                     "equality or bound explicitly, or prove a helper lemma above and use it. A split row "
+                     "shows which leaves survived; refine those. Then write the file again.")
     if false_rows:
         lines.append("  WARNING: nitpick found a counterexample to the statement(s) at line(s) "
                      f"{[r.get('line') for r in false_rows]}: they are FALSE as written. Fix the statement "

@@ -631,3 +631,19 @@ def test_leaf_rule_keeps_a_filler_written_split_skeleton_and_refuses_a_hand_writ
     # keys exist for the apply lines, and a reworded leaf is still a new leaf
     assert any(k[1].endswith("done") for k in leaves.leaf_keys(skeleton))
     assert reg.invoke("write_file", json.dumps({"content": skeleton.replace("subgoal by simp", "subgoal by auto")})).startswith("REJECTED")
+
+
+def test_leaf_rejection_and_open_fill_rows_tell_the_model_to_restate(tmp_path):
+    """Rep-1 observation (2026-11-10): many leaf-rule rejections after a fill
+    failed -- the model wrote the closer itself. Both messages the model reads
+    at that moment now say: restate the step, do not write the closer."""
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    out = reg.invoke("write_file", json.dumps({"content": THY.replace("sorry", "by simp")}))
+    assert out.startswith("REJECTED") and "RESTATE the step" in out and "helper lemma" in out
+    d = {"filled": 0, "n": 1, "stages": {"open": 1},
+         "results": [{"line": 5, "outcome": "none", "stage": "sledgehammer", "method": None, "goal": "hard"}]}
+    s = rs._fill_summary(at, d)
+    assert "NEXT: the filler could not close" in s and "split each into smaller `have`s" in s
+    # a plain-arm summary (no leaf rule) carries no such instruction
+    at2, b2, reg2 = make(tmp_path, arm="plain")
+    assert "NEXT:" not in rs._fill_summary(at2, d)
