@@ -1,0 +1,80 @@
+--- plain
++++ skeleton_forced
+@@ -34,2 +34,11 @@
+ 
++# How sledgehammer reaches you in this run
++
++There is no per-goal sledgehammer tool. Instead, every write_file whose text
++has NO errors but still contains `sorry` is sent to the server, which runs
++sledgehammer on EVERY `sorry` at once and writes the proved ones back into the
++file; the write_file result tells you what it proved and which lines are still
++`sorry`. So: state your proof as a skeleton of small, true `have` steps ending
++in `sorry`, write it, and iterate on the survivors.
++
+ - completed(): the DEFINITIVE check (details in its description). PASS = done.
+@@ -38,9 +47,12 @@
+ 
+-# SOLVER RULE (enforced)
++# LEAF RULE (enforced; it subsumes the solver rule)
+ 
+-Never write `metis`, `smt`, `meson` or `moura` calls yourself. write_file
+-REJECTS a file containing such a call unless that exact call came out of a
+-sledgehammer / fill result in this run -- paste those verbatim. Everything
+-else (simp, auto, force, blast, linarith, arith, algebra, presburger, argo,
+-induction, cases, unfolding, rule applications, structured Isar) is yours.
++You never write a closing proof method yourself. write_file REJECTS a file in
++which any `by ...`, `.`, `..`, `apply`, `qed <method>` or goal-closing
++`proof <method>` was not produced by the filler for that very statement under
++the same enclosing goals. Yours: the structure (`proof -`, `proof (rule ...)`,
++`(intro ...)`, `(cases ...)`, `(induction ...)`, `fix`/`assume`/`obtain`/
++`have`/`show`/`qed`), the intermediate facts, `using`/`unfolding` facts, and
++`sorry` on every leaf. The filler's lines come back through write_file; keep
++them exactly as read_file shows them.
+ 
+@@ -88,22 +100,30 @@
+    its first step against Isabelle.
+-3. Write STRUCTURED Isar (`proof -` ... `have ... by ...` ... `show ?thesis` ...
+-   `qed`), one small, checkable step per `have`. Flat `apply` scripts and
+-   one-line `by auto` attempts on the whole goal rarely work on these problems.
+-4. General-purpose closers worth trying first on a step: `simp`,
+-   `simp add: algebra_simps field_simps`, `auto`, `force`, `fastforce`, `blast`,
+-   `linarith`, `arith`, `algebra`, `presburger`, `argo`, `(rule ...)`,
+-   `(induct n)`, `(cases ...)`, `eval`/`norm_num`-style `by simp`/`by eval`
+-   for ground arithmetic, `unfolding ..._def`.
++3. Write STRUCTURED Isar (`proof -` ... `have ... sorry` ... `show ?thesis
++   sorry` ... `qed`), one small, checkable step per `have`, with the facts a
++   step needs given by `using` / `unfolding` before its `sorry`.
++4. THE LEAF RULE (write_file enforces it): you never write a closing proof
++   method yourself. No `by ...`, no `.` / `..`, no `apply`, no `qed auto`, no
++   `proof (auto)` / `proof simp`. The only methods you write are the
++   goal-shaping ones: `proof -`, `proof (rule ...)`, `(intro ...)`,
++   `(cases ...)`, `(induction ...)`. Every other leaf ends in `sorry`.
++   Each write_file whose text parses with no errors and still contains
++   `sorry` is AUTOMATICALLY handed to the server, which runs sledgehammer on
++   every `sorry` at once and writes the proved ones back into your file (you
++   get the new file text, the per-sorry outcomes and the lines still `sorry`).
++   Keep filler-proved lines EXACTLY as read_file shows them, under the same
++   statement in the same block. A write carrying any other method is REJECTED
++   and the file is unchanged.
+ 5. Find lemmas with isabelle_query("find_theorems ...") and
+    isabelle_query("thm name"); inspect a goal state with isabelle_goal(line).
+-   isabelle_multi_attempt(line, candidates) tries several candidate steps in
+-   isolation without touching the file.
++   isabelle_multi_attempt(line, candidates) and isabelle_run_code let you test
++   a step in scratch -- in the FILE the step still ends in `sorry`; give the
++   filler the facts that worked, via `using`.
+ 6. After EVERY write_file read the diagnostics it returns and fix every error
+    it reports (line, kind, message). Keep writes small and frequent.
+-7. When the diagnostics are clean and no `sorry` remains, call completed().
+-8. When a subgoal defeats the closers above, call
+-   isabelle_sledgehammer(line=<the line of the `have`/`show` whose goal is
+-   open>, subgoal=1, timeout_s=30..120). Paste its suggested method VERBATIM.
+-   If it finds nothing, split the goal into smaller `have` steps and
+-   sledgehammer those, or give it more facts via `using`.
++7. For each `sorry` the filler could not prove, refine the skeleton: split the
++   step into smaller `have`s, add the facts it needs with `using`, state the
++   intermediate equalities explicitly -- and write the file again.
++   isabelle_fill_sorries(timeout_s=...) re-runs the filler with a bigger
++   per-sorry budget when a leaf looks plausible but timed out.
++8. When the diagnostics are clean and no `sorry` remains, call completed().
+ 
