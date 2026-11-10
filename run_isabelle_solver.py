@@ -78,6 +78,22 @@ def auto_fill_budget(n_sorries: int) -> int:
     to notice and re-run the explicit tool with a bigger budget by itself."""
     return max(FILL_MAX_TOTAL_S, min(FILL_MAX_TOTAL_CEIL_S, FILL_S_PER_SORRY * n_sorries))
 FILL_PATIENCE_S = 240         # the MCP returns `continuing` after this
+FILL_MIN_REMAINING_S = 180    # no fill round starts with less than this left on the wall clock
+# The staged filler (IPS 2026-11-10): cheap closers before the hammer, a nitpick
+# verdict on what try0 cannot close, a structured retry, intro-splitting with a
+# second pass, and sibling sessions. Env-tunable so a pass can switch stages off.
+FILL_TRY0_S = int(os.environ.get("IB_FILL_TRY0_S", "5"))
+FILL_NITPICK_S = int(os.environ.get("IB_FILL_NITPICK_S", "10"))
+FILL_ISAR = os.environ.get("IB_FILL_ISAR", "1") == "1"
+FILL_SPLIT = os.environ.get("IB_FILL_SPLIT", "1") == "1"
+FILL_PARALLEL = int(os.environ.get("IB_FILL_PARALLEL", "2"))
+
+
+def fill_stage_options() -> dict:
+    return {"try0_s": FILL_TRY0_S, "nitpick_s": FILL_NITPICK_S, "isar": FILL_ISAR,
+            "split": FILL_SPLIT, "parallel": FILL_PARALLEL}
+GIVE_UP_STOPS = 3             # consecutive turns without a tool call that end the attempt
+SLEDGEHAMMER_MAX_S = 90       # cap on the model's per-goal sledgehammer timeout_s
 ATTEMPT_TIMEOUT_S = 180       # multi_attempt / run_code per candidate
 # Wall budget for the session's check of the whole file after a write. The
 # MCP default (120 s) was too short for an 850-line file; isabelle-humanize
@@ -184,6 +200,12 @@ class _Attempt:
             leaves.leaf_keys(self.thy.read_text(encoding="utf-8"))
             if arm.filler_only and self.thy.exists() else set())
         self.leaf_rejections = 0
+        self.frozen_rejections = 0   # writes refused for touching the frozen header/statements
+        # give-up detection (pass 1, 2026-11-08/09: plain P3 and P6 stopped trying and
+        # were nudged 489 and 425 times until the wall; see docs/pass1-analysis-2026-11-10.md)
+        self.consecutive_stops = 0
+        self.gave_up = False
+        self.deadline: float | None = None   # wall-clock end of the attempt, when a timeout is set
         # outcome (set only by the finishing tools)
         self.kind: str | None = None          # None | completed | disproved
         self.disproof_file = ""
@@ -200,6 +222,8 @@ class _Attempt:
         self.fills = 0
         self.fill_sorries_total = 0
         self.fill_sorries_proved = 0
+        self.fill_stages: dict[str, int] = {}     # how the filler settled sorries: try0 / sledgehammer / isar / split / nitpick(false)
+        self.fill_false = 0                       # statements nitpick found false
         self.auto_fills = 0
         self.sledgehammer_calls = 0
         self.sledgehammer_found = 0
@@ -209,6 +233,10 @@ class _Attempt:
 
     def count(self, name: str) -> None:
         self.tool_calls[name] = self.tool_calls.get(name, 0) + 1
+        self.consecutive_stops = 0            # a tool call is work; the give-up counter restarts
+
+    def remaining_s(self) -> float | None:
+        return None if self.deadline is None else self.deadline - time.time()
 
     def note_filler_text(self, raw: str) -> None:
         """Leaf rule: every leaf in a text the filler returned is allowed from
@@ -451,6 +479,23 @@ def _register_file_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
                         "it, and filler-proved lines are kept verbatim under the same statement. "
                         f"{len(bad)} offending line(s):\n" + leaves.summarize(bad) +
                         "\nPut `sorry` on those steps (with the `using` facts they need) and write again.")
+        # The frozen parts (header, definition blocks, theorem statements) are
+        # the verifier's rule; checking them only at completed() let the forced
+        # P2 run (2026-11-09) spend its last two hours on a 15-line scratch file
+        # with no theorem in it. Everything but the sorry check applies here.
+        try:
+            frozen = [f for f in ib.textual_checks(content, at.entry, at.variant)
+                      if not f.startswith("file still contains sorry")]
+        except Exception as e:                           # noqa: BLE001
+            frozen = [f"cannot check the file: {type(e).__name__}: {e}"]
+        if frozen:
+            at.rejected_writes += 1
+            at.frozen_rejections += 1
+            return ("REJECTED (file unchanged): the frozen parts of the file are missing or changed -- "
+                    + "; ".join(frozen[:6]) +
+                    ". Keep the theory header, every definition block and every theorem statement "
+                    "exactly as staged; add helper lemmas above the theorems and replace only the "
+                    "proofs. Test scratch lemmas with isabelle_run_code, not in this file.")
         at.thy.write_text(content, encoding="utf-8")
         at.writes += 1
         diag, errors, has_sorry = at.diagnostics()
@@ -501,12 +546,35 @@ def _fill_summary(at: _Attempt, d: dict) -> str:
     at.fill_sorries_total += len(res)
     proved = [r for r in res if r.get("outcome") == "proved" and r.get("method")]
     at.fill_sorries_proved += len(proved)
+    for k, v in (d.get("stages") or {}).items():
+        if k != "open":
+            at.fill_stages[k] = at.fill_stages.get(k, 0) + int(v)
+    false_rows = [r for r in res if r.get("outcome") == "false"]
+    at.fill_false += len(false_rows)
+    stages = d.get("stages") or {}
     lines = [f"fill_sorries: {len(proved)}/{len(res)} sorry(s) proved"
+             + (f" [{', '.join(f'{k} {v}' for k, v in stages.items())}]" if stages else "")
              + (f" (job error: {d.get('error')})" if d.get("error") else "")]
     for r in res:
-        lines.append(f"  line {r.get('line')}: {r.get('outcome')}"
-                     + (f" -> {r.get('method')}" if r.get("method") else "")
-                     + (f" ({r.get('reason')})" if r.get("reason") else ""))
+        method = r.get("method")
+        head = f"  line {r.get('line')}: {r.get('outcome')}"
+        if r.get("stage") and r.get("outcome") in ("proved", "split", "false"):
+            head += f" [{r['stage']}]"
+        if method:
+            one = " ".join(str(method).split())
+            head += f" -> {one if len(one) <= 160 else one[:157] + '...'}"
+        if r.get("split"):
+            head += f" (split into {r['split'].get('k')} leaves, {r['split'].get('proved')} proved)"
+        elif r.get("reason"):
+            head += f" ({r.get('reason')})"
+        lines.append(head)
+        if r.get("outcome") not in ("proved",) and r.get("goal"):
+            lines.append(f"      goal: {str(r['goal'])[:200]}")
+    if false_rows:
+        lines.append("  WARNING: nitpick found a counterexample to the statement(s) at line(s) "
+                     f"{[r.get('line') for r in false_rows]}: they are FALSE as written. Fix the statement "
+                     "(a missing hypothesis, a wrong bound or quantifier); do not try to prove it. While a "
+                     "false `sorry` stays in the file, other proofs may silently rest on it.")
     return "\n".join(lines)
 
 
@@ -518,8 +586,16 @@ def _auto_fill(at: _Attempt) -> str:
     at.count("auto:isabelle_fill_sorries")
     n_sorries = len(re.findall(r"\bsorry\b", ib.strip_comments(at.thy.read_text(encoding="utf-8"))))
     budget = auto_fill_budget(n_sorries)
+    remaining = at.remaining_s()
+    if remaining is not None:
+        # A fill job that outlives the attempt is wasted (forced P6, pass 1,
+        # ended inside one); shrink it to what is left, or skip it.
+        if remaining < FILL_MIN_REMAINING_S:
+            return (f"fill_sorries skipped: only {remaining:.0f}s remain in this attempt, "
+                    "not enough for a sledgehammer round.")
+        budget = max(60, min(budget, int(remaining - 120)))
     raw = at.mcp("isabelle_fill_sorries", {"timeout_s": FILL_TIMEOUT_S, "max_total_s": budget,
-                                          "patience_s": FILL_PATIENCE_S})
+                                          "patience_s": FILL_PATIENCE_S, **fill_stage_options()})
     d = _collect_fill(at, raw, budget)
     summary = _fill_summary(at, d)
     patched = d.get("patched_text") if isinstance(d, dict) else None
@@ -580,6 +656,14 @@ def _register_mcp_tools(reg: agentlib.ToolRegistry, at: _Attempt, available: lis
                     kwargs.setdefault("timeout_s", FILL_TIMEOUT_S)
                     kwargs.setdefault("max_total_s", FILL_MAX_TOTAL_S)
                     kwargs.setdefault("patience_s", FILL_PATIENCE_S)
+                    for k, v in fill_stage_options().items():
+                        kwargs.setdefault(k, v)
+                    remaining = at.remaining_s()
+                    if remaining is not None:
+                        if remaining < FILL_MIN_REMAINING_S:
+                            return (f"fill_sorries refused: only {remaining:.0f}s remain in this attempt, "
+                                    "not enough for a sledgehammer round.")
+                        kwargs["max_total_s"] = max(60, min(int(kwargs["max_total_s"]), int(remaining - 120)))
                     raw = at.mcp(n, kwargs)
                     d = _collect_fill(at, raw)
                     if "raw" in d:
@@ -600,8 +684,23 @@ def _register_mcp_tools(reg: agentlib.ToolRegistry, at: _Attempt, available: lis
                         at.sanctioned |= extract_solver_calls(patched)
                     return _fill_summary(at, d) + ("\n\npatched_text:\n" + patched if patched and d.get("filled") else "")
                 if n == "isabelle_sledgehammer":
+                    # Pass 1: the model escalated timeout_s to 120..300 after
+                    # failures (plain P6: 42 calls, 114 min, 2 found); the server
+                    # overran its budget past 120 s and answered 500. More seconds
+                    # buy nothing (docs/research-pipeline-2026-11-10.md, 2a).
                     kwargs.setdefault("timeout_s", 60)
-                    kwargs["timeout_s"] = min(int(kwargs["timeout_s"]), TOOL_TIMEOUT_S - 30)
+                    kwargs["timeout_s"] = min(int(kwargs["timeout_s"]), SLEDGEHAMMER_MAX_S)
+                    raw = at.mcp(n, kwargs)
+                    if re.search(r'"error": "http_5\d\d"|Backend call timed out|did not finish within|timed out \(budget', raw):
+                        return json.dumps({
+                            "found": False,
+                            "error": f"the server could not finish sledgehammer within its budget "
+                                     f"(timeout_s={kwargs['timeout_s']}). Do not retry with a longer "
+                                     "timeout: this goal is too hard for the provers as stated. Split "
+                                     "the step into smaller `have`s, add the facts it needs with `using`, "
+                                     "or try simple closers (simp, auto, blast, linarith) instead.",
+                            "server_said": raw[:300]})
+                    return raw
                 return at.mcp(n, kwargs)
             return fn
 
@@ -722,6 +821,27 @@ def _register_finishing_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
 # --------------------------------------------------------------------------- #
 # Prompt and nudge
 # --------------------------------------------------------------------------- #
+
+def _make_should_continue(at: _Attempt):
+    """agentlib asks this after every turn that ended without a tool call:
+    a string continues the run with that message, None ends it. A stop after
+    the run is over is the final report. Otherwise the model is nudged -- but
+    only GIVE_UP_STOPS times in a row: pass 1 (2026-11-08/09) nudged a model
+    that had written "I was unable to complete the proof" 489 times on P3 and
+    425 on P6, three hours each, at 600 k tokens a call. Any tool call resets
+    the counter (`_Attempt.count`), so a model that is working is never cut."""
+    def should_continue(assistant_msg, step_idx):
+        if at.kind is not None:
+            return None
+        at.consecutive_stops += 1
+        if at.consecutive_stops >= GIVE_UP_STOPS:
+            at.gave_up = True
+            print(f"[harness] GAVE UP: {GIVE_UP_STOPS} consecutive turns without a tool call; ending the attempt",
+                  flush=True)
+            return None
+        return _nudge(at)
+    return should_continue
+
 
 def _nudge(at: _Attempt) -> str:
     at.nudges += 1
@@ -1147,10 +1267,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
                 f"formalized goal is false -- when you have proven that and called disproved()."
             )
 
-            def should_continue(assistant_msg, step_idx):
-                if at.kind is not None:
-                    return None
-                return _nudge(at)
+            should_continue = _make_should_continue(at)
 
             def _alarm(signum, frame):
                 raise _Timeout()
@@ -1158,6 +1275,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
             if args.timeout:
                 signal.signal(signal.SIGALRM, _alarm)
                 signal.alarm(args.timeout)
+                at.deadline = time.time() + args.timeout
             max_steps = args.max_steps if args.max_steps > 0 else UNLIMITED_STEPS
             t0 = time.time()
             try:
@@ -1226,7 +1344,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
     if at is not None:
         print(f"finishing tool : {at.kind or '(none called)'}")
         print(f"nudges         : {at.nudges}   failed completions: {at.failed_completions}")
-        print(f"writes         : {at.writes} (rejected {at.rejected_writes}, leaf rule {at.leaf_rejections})  fills: {at.fills} "
+        print(f"writes         : {at.writes} (rejected {at.rejected_writes}: leaf rule {at.leaf_rejections}, frozen {at.frozen_rejections})  fills: {at.fills} "
               f"({at.fill_sorries_proved}/{at.fill_sorries_total} sorries)  sledgehammer: "
               f"{at.sledgehammer_found}/{at.sledgehammer_calls}  busy retries: {at.busy_retries} "
               f"(releases {at.releases})")
@@ -1237,7 +1355,8 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
 
     status = ("solved" if passed else
               "disproved" if (at is not None and at.kind == "disproved" and not timed_out) else
-              "timeout" if timed_out else "failed")
+              "timeout" if timed_out else
+              "gave_up" if (at is not None and at.gave_up) else "failed")
     row = {
         "problem": problem, "source": entry["source"], "category": entry.get("category"),
         "arm": arm_name, "variant": variant, "rep": rep, "model": cfg.model,
@@ -1256,9 +1375,11 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
             "finishing_tool": at.kind, "nudges": at.nudges, "failed_completions": at.failed_completions,
             "verifier_unavailable": at.verifier_unavailable,
             "tool_calls": at.tool_calls, "writes": at.writes, "rejected_writes": at.rejected_writes,
-            "leaf_rejections": at.leaf_rejections,
+            "leaf_rejections": at.leaf_rejections, "frozen_rejections": at.frozen_rejections,
+            "gave_up": at.gave_up,
             "fills": at.fills, "auto_fills": at.auto_fills,
             "fill_sorries_total": at.fill_sorries_total, "fill_sorries_proved": at.fill_sorries_proved,
+            "fill_stages": at.fill_stages, "fill_false": at.fill_false, "fill_options": fill_stage_options(),
             "sledgehammer_calls": at.sledgehammer_calls, "sledgehammer_found": at.sledgehammer_found,
             "tool_time_s": round(at.tool_time_s, 1),
             "busy_retries": at.busy_retries, "releases": at.releases,
@@ -1316,7 +1437,13 @@ def main() -> int:
         return 0 if status == "solved" else 1
 
     n_done = ok = 0
+    stop_file = Path(args.runs_dir) / "STOP"
     while args.loop == 0 or n_done < args.loop:
+        if stop_file.exists():
+            # `scripts/imo2026_pass.py stop` drops this file: finish the current
+            # row, claim no more (a server restart can then happen between rows).
+            print(f"[harness] {stop_file} present; not claiming another row", flush=True)
+            break
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = ib.cmd_claim(SimpleNamespace(owner=owner, pid=os.getpid(), arm=args.arm, problem=None))

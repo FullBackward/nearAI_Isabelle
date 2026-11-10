@@ -357,6 +357,25 @@ dead claim and the worker continues from the next todo row. Kill with
 `pkill -f run_isabelle_solver` and clean up `poly` as in 5a if a build was
 in flight.
 
+### 5c. Deploying a Pool Server change between attempts
+
+The staged filler (2026-11-10) and the sledgehammer-budget fix (2026-11-09)
+live in the IPS checkout and its Scala/ML backend; a restart drops live
+sessions, so do it between attempts:
+
+```bash
+cd ~/nearAI_Isabelle && .venv/bin/python scripts/imo2026_pass.py stop     # worker finishes its row and exits
+.venv/bin/python scripts/imo2026_pass.py status                            # wait for "worker: none running"
+cd ~/Isabelle-Pool-Server && git pull && isabelle scala_build
+pkill -f server.app.main; sleep 5; pgrep -af poly || echo "no stray prover"
+setsid nohup python -m server.app.main > logs/server.stdout.log 2>&1 < /dev/null &
+sleep 90; curl -s localhost:8000/healthz
+cd ~/nearAI_Isabelle && git pull && .venv/bin/python -m pytest -q tests
+# stage 1 rerun: the forced arm once more on all six, as rep 1
+.venv/bin/python scripts/imo2026_pass.py --arms skeleton_forced repeat 2 --all
+.venv/bin/python scripts/imo2026_pass.py launch
+```
+
 ## 6. Results
 
 ```bash

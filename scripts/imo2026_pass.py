@@ -180,6 +180,10 @@ def cmd_launch(args) -> int:
         return 0
     logs = ROOT / "runs"
     logs.mkdir(parents=True, exist_ok=True)
+    stop = logs / "STOP"
+    if stop.exists():
+        stop.unlink()
+        print("removed a leftover STOP file")
     log = logs / f"{args.owner}.log"
     cmd = [sys.executable, str(ROOT / "run_isabelle_solver.py"), "--loop", "0",
            "--timeout", str(args.timeout), "--owner", args.owner, "--results", args.results]
@@ -199,8 +203,19 @@ def cmd_launch(args) -> int:
 def _cell(r: dict | None) -> str:
     if r is None:
         return "-"
-    s = {"solved": "SOLVED", "failed": "failed", "timeout": "timeout", "disproved": "disproved"}.get(r["status"], r["status"])
+    s = {"solved": "SOLVED", "failed": "failed", "timeout": "timeout", "gave_up": "gave up", "disproved": "disproved"}.get(r["status"], r["status"])
     return f"{s} {r.get('elapsed_s', 0) / 60:.0f}m"
+
+
+def cmd_stop(args) -> int:
+    """Ask the worker to finish its current attempt and claim no more rows.
+    `launch` removes the file again."""
+    stop = ROOT / "runs" / "STOP"
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"), encoding="utf-8")
+    alive = worker_alive()
+    print(f"STOP file written: {stop}. " + ("The worker finishes: " + "; ".join(alive) if alive else "No worker is running."))
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -305,6 +320,8 @@ def main() -> int:
     s.add_argument("--dry-run", action="store_true", help="run the checks, start nothing")
     s.set_defaults(fn=cmd_launch)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("stop", help="let the worker finish its current attempt, then stop (writes runs/STOP)")
+    s.set_defaults(fn=cmd_stop)
     s = sub.add_parser("report", help="per-problem table and the repeat recommendation")
     s.add_argument("--rep", type=int, default=0); s.set_defaults(fn=cmd_report)
     args = p.parse_args()

@@ -28,7 +28,18 @@ docs/experiment-design.md the design and open decisions.
   outage, not a failed completion. A passing `completed()` writes `verified.thy` and freezes
   `write_file`; `_final_verify` (run before the session is closed) judges those bytes, and never
   builds a file the session is still running. Every MCP call the harness makes is an `mcp`
-  record in `transcript.jsonl`. The solver rule deliberately does NOT bind a sledgehammer
+  record in `transcript.jsonl`. Pass-1 fixes (2026-11-10): three consecutive turns without a
+  tool call end the attempt as `gave_up` (any tool call resets the counter); `write_file` refuses
+  a file whose frozen header/definitions/statements are missing or changed (sorry is still
+  allowed there); the model's sledgehammer `timeout_s` is capped at 90 s and a server timeout is
+  worded as "too hard as stated, split the goal"; no fill round starts with under 180 s left on
+  the wall; `runs/STOP` makes a queue worker finish its row and exit (`imo2026_pass.py stop`).
+  Staged filler (IPS 2026-11-10): `fill_stage_options()` (try0 / nitpick / isar / split /
+  parallel, env `IB_FILL_*`) goes with every fill call; `_fill_summary` prints the stage per row,
+  the goal of every unproved row and a WARNING for nitpick-false statements; `fill_stages` and
+  `fill_false` are in the results row. `harness/leaves.py` keys filler-written `apply`/`subgoal`/
+  `done` lines (split skeletons) so they pass the leaf rule verbatim.
+  The solver rule deliberately does NOT bind a sledgehammer
   result to the goal it was found for (owner decision, 2026-11-05: metis transplants are a finding,
   see docs/experiment-design.md). The solver rule lives in `extract_solver_calls` /
   `sanctioned_from_output`; the skeleton arm's automatic fill in `_auto_fill`.

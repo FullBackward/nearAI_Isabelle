@@ -116,6 +116,21 @@ for i in 1 2; do nohup .venv/bin/python run_isabelle_solver.py --loop 0 > runs/w
 .venv/bin/python scripts/imo2026_pass.py repeat 3   # reps 1..2 of the recommended subset (or --all), then launch again
 ```
 
+A model that stops without a tool call is nudged, but only twice in a row: the third
+consecutive stop ends the attempt as `gave_up` (pass 1 burned three hours per miss on
+nudges). `write_file` refuses to drop or alter the frozen header, definitions or theorem
+statements. `scripts/imo2026_pass.py stop` lets a worker finish its attempt and exit.
+`config/model.example.json` now compacts at 50 % of the context window (plain P2 ran at
+741 k tokens per call under the old 80 %); copy that setting into your `config/model.json`.
+
+The filler is staged (Pool Server 2026-11-10): cheap closers (`try0`, 5 s per method) before
+sledgehammer; nitpick on what try0 cannot close, so a false statement comes back as `false`
+with its counterexample; a structured-proof retry when a prover found a proof the one-liner
+could not reconstruct; a failed conjunction / universal / implication / iff is split into
+`intro` leaves and the leaves attacked in a second pass; two sessions share the sorries. Each
+result row says which stage settled it, and the results file carries `fill_stages`. Env knobs:
+`IB_FILL_TRY0_S`, `IB_FILL_NITPICK_S`, `IB_FILL_ISAR`, `IB_FILL_SPLIT`, `IB_FILL_PARALLEL`.
+
 Budgets follow upstream: no step cap, wall clock only (`--timeout 14400`, 4 h per
 attempt; `--max-steps N` adds a turn cap if you want one). Two inner limits
 matter: the session's check of a written file (`IB_LOAD_TIMEOUT`, 600 s; a check

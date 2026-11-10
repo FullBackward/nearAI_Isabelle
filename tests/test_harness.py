@@ -509,3 +509,125 @@ def test_final_verify_never_raises(tmp_path, monkeypatch):
     at.thy.write_text(THY.replace("sorry", "by simp"))
     ok, report = rs._final_verify(at, ENTRY, "wsolution")
     assert not ok and "verifier error: RuntimeError: boom" in report
+
+
+def _all_tools(arm):
+    """The MCP tool list the arm expects, as the registry check wants it."""
+    return [{"name": n, "description": n, "parameters": {"type": "object", "properties": {"file_path": {}, "timeout_s": {}, "max_total_s": {}}, "required": ["file_path"]}}
+            for n in ARMS[arm].mcp_tools]
+
+
+# ---- pass-1 fixes (2026-11-10) --------------------------------------------- #
+
+def test_three_consecutive_stops_end_the_attempt_and_a_tool_call_resets():
+    """Pass 1: plain P3/P6 were nudged 489/425 times after the model had given
+    up. Two stops are nudged, the third ends the run; any tool call resets."""
+    at, b, reg = make(__import__("pathlib").Path(__import__("tempfile").mkdtemp()))
+    sc = rs._make_should_continue(at)
+    assert sc(None, 1) and sc(None, 2) and at.nudges == 2 and not at.gave_up
+    reg.invoke("read_file", "{}")                      # work: counter restarts
+    assert at.consecutive_stops == 0
+    assert sc(None, 3) and sc(None, 4) and sc(None, 5) is None and at.gave_up
+    # after a PASS the stop is the final report, never a nudge
+    at2, b2, reg2 = make(__import__("pathlib").Path(__import__("tempfile").mkdtemp()))
+    at2.kind = "completed"
+    assert rs._make_should_continue(at2)(None, 1) is None and not at2.gave_up
+
+
+def test_write_that_drops_or_changes_the_frozen_statement_is_refused(tmp_path):
+    """Forced P2, pass 1: the model used write_file as a scratchpad and ended
+    with a 15-line file holding no theorem. The frozen parts are checked at
+    write time now; sorry is still allowed (that is completed()'s business)."""
+    at, b, reg = make(tmp_path)
+    scratch = 'theory t1 imports Main\nbegin\n\nlemma test_x: "1 = (1::nat)"\n  by simp\n\nend\n'
+    out = reg.invoke("write_file", json.dumps({"content": scratch}))
+    assert out.startswith("REJECTED") and "frozen" in out and at.frozen_rejections == 1
+    assert at.thy.read_text() == THY
+    changed = THY.replace('shows "True"', 'shows "True \\<or> False"')
+    assert reg.invoke("write_file", json.dumps({"content": changed})).startswith("REJECTED")
+    assert reg.invoke("write_file", json.dumps({"content": THY.replace("imports Main", "imports Complex_Main")})).startswith("REJECTED")
+    # the same statement with helper lemmas above and sorry inside is fine
+    ok = THY.replace("theorem t1", 'lemma helper: "2 = (2::nat)"\n  by simp\n\ntheorem t1')
+    assert reg.invoke("write_file", json.dumps({"content": ok})).startswith("wrote")
+
+
+def test_sledgehammer_timeout_is_clamped_and_a_server_timeout_is_worded(tmp_path):
+    at, b, reg = make(tmp_path)
+    rs._register_mcp_tools(reg, at, _all_tools("plain"))
+    reg.invoke("isabelle_sledgehammer", json.dumps({"timeout_s": 300}))
+    assert b.calls[-1][1]["timeout_s"] == rs.SLEDGEHAMMER_MAX_S
+    b.sh = {"error": "http_504", "detail": "Backend call timed out after 150.0s"}
+    out = json.loads(reg.invoke("isabelle_sledgehammer", json.dumps({"timeout_s": 60})))
+    assert out["found"] is False and "Do not retry with a longer timeout" in out["error"] and "150.0s" in out["server_said"]
+    b.sh = {"found": True, "results": ["by simp"]}
+    assert '"found": true' in reg.invoke("isabelle_sledgehammer", "{}")
+
+
+def test_fill_rounds_respect_the_wall_clock(tmp_path):
+    """Forced P6, pass 1, ended inside a fill job. With little time left the
+    automatic round is skipped and the explicit tool refuses; otherwise the
+    job cap shrinks to what remains."""
+    import time as _t
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    at.deadline = _t.time() + 100
+    out = reg.invoke("write_file", json.dumps({"content": THY}))
+    assert "fill_sorries skipped" in out and not any(c[0] == "isabelle_fill_sorries" for c in b.calls)
+    at.deadline = _t.time() + 400
+    reg.invoke("write_file", json.dumps({"content": THY}))
+    fill_args = [a for n, a in b.calls if n == "isabelle_fill_sorries"]
+    assert fill_args and 270 <= fill_args[-1]["max_total_s"] <= 280
+    rs._register_mcp_tools(reg, at, _all_tools("skeleton_forced"))
+    at.deadline = _t.time() + 50
+    assert reg.invoke("isabelle_fill_sorries", "{}").startswith("fill_sorries refused")
+
+
+# ---- staged filler (IPS 2026-11-10) ---------------------------------------- #
+
+def test_fill_summary_reports_stages_goals_and_false_statements(tmp_path):
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    d = {"filled": 2, "n": 4, "continuing": False, "stages": {"try0": 1, "split": 1, "nitpick": 1, "open": 1},
+         "results": [
+             {"line": 3, "outcome": "proved", "stage": "try0", "method": "by simp", "goal": "1 + 1 = 2"},
+             {"line": 5, "outcome": "false", "stage": "nitpick", "method": None, "nitpick": "genuine",
+              "reason": "nitpick: genuine counterexample -- n = 5", "goal": "∀n. n < 5"},
+             {"line": 7, "outcome": "split", "stage": "split", "method": "apply (intro conjI impI allI ballI iffI)\nsubgoal by simp\nsubgoal sorry\ndone",
+              "split": {"k": 2, "proved": 1}, "goal": "A ∧ B"},
+             {"line": 9, "outcome": "none", "stage": "sledgehammer", "method": None, "goal": "hard"}]}
+    out = rs._fill_summary(at, d)
+    assert "1/4 sorry(s) proved [try0 1, split 1, nitpick 1, open 1]" in out
+    assert "line 3: proved [try0] -> by simp" in out
+    assert "line 5: false [nitpick]" in out and "WARNING: nitpick found a counterexample" in out and "[5]" in out
+    assert "split into 2 leaves, 1 proved" in out and "goal: A ∧ B" in out and "goal: hard" in out
+    assert at.fill_stages == {"try0": 1, "split": 1, "nitpick": 1} and at.fill_false == 1
+
+
+def test_fill_calls_carry_the_stage_options(tmp_path):
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    reg.invoke("write_file", json.dumps({"content": THY}))
+    args = [a for n, a in b.calls if n == "isabelle_fill_sorries"][-1]
+    assert args["try0_s"] == rs.FILL_TRY0_S and args["nitpick_s"] == rs.FILL_NITPICK_S
+    assert args["split"] is rs.FILL_SPLIT and args["isar"] is rs.FILL_ISAR and args["parallel"] == rs.FILL_PARALLEL
+    rs._register_mcp_tools(reg, at, _all_tools("skeleton_forced"))
+    reg.invoke("isabelle_fill_sorries", json.dumps({"timeout_s": 60}))
+    args = [a for n, a in b.calls if n == "isabelle_fill_sorries"][-1]
+    assert args["timeout_s"] == 60 and args["try0_s"] == rs.FILL_TRY0_S
+
+
+def test_leaf_rule_keeps_a_filler_written_split_skeleton_and_refuses_a_hand_written_one(tmp_path):
+    from harness import leaves
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    skeleton = ('theory t1 imports Main\nbegin\n\ntheorem t1: shows "True"\n'
+                '  apply (intro conjI impI allI ballI iffI)\n  subgoal by simp\n  subgoal sorry\n  done\n\nend\n')
+    # hand-written: refused (apply script)
+    out = reg.invoke("write_file", json.dumps({"content": skeleton}))
+    assert out.startswith("REJECTED") and "apply-script" in out
+    # the same text as a filler result: accepted, including the `done`
+    b.fill = {"filled": 1, "n": 1, "continuing": False,
+              "results": [{"line": 5, "outcome": "split", "stage": "split", "method": "apply (intro conjI impI allI ballI iffI)\nsubgoal by simp\nsubgoal sorry\ndone", "split": {"k": 2, "proved": 1}}],
+              "patched_text": skeleton}
+    reg.invoke("write_file", json.dumps({"content": THY}))
+    assert at.thy.read_text() == skeleton
+    assert reg.invoke("write_file", json.dumps({"content": skeleton})).startswith("wrote")
+    # keys exist for the apply lines, and a reworded leaf is still a new leaf
+    assert any(k[1].endswith("done") for k in leaves.leaf_keys(skeleton))
+    assert reg.invoke("write_file", json.dumps({"content": skeleton.replace("subgoal by simp", "subgoal by auto")})).startswith("REJECTED")

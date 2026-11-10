@@ -215,8 +215,10 @@ def _scan(text: str):
 
 def leaf_keys(text: str) -> set[Key]:
     """Keys of every method leaf of `text` -- call on text the filler wrote
-    (and on the staged statement file, whose own proofs are given)."""
-    return {key for _ln, kind, key, _t in _scan(text) if kind == "method"}
+    (and on the staged statement file, whose own proofs are given). Apply-style
+    lines are keyed too: the staged filler (2026-11-10) splits a goal into
+    `apply (intro ...)` + `subgoal by m` + `done`, and those lines are its."""
+    return {key for _ln, kind, key, _t in _scan(text) if kind in ("method", "apply")}
 
 
 def check(text: str, allowed: set[Key]) -> list[Violation]:
@@ -227,6 +229,8 @@ def check(text: str, allowed: set[Key]) -> list[Violation]:
         if kind == "sorry":
             continue
         if kind == "apply":
+            if key in allowed:
+                continue                       # a filler-written split skeleton, kept verbatim
             out.append(Violation(ln, t, "apply-script step; only `sorry` or a filler-written `by`"))
         elif kind == "initial":
             out.append(Violation(ln, t, "initial method that can close goals; use `proof -`, "

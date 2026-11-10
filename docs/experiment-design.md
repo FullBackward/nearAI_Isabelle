@@ -245,6 +245,26 @@ its first `completed()`; the file it submitted (854 lines, 3 metis calls, no
   that the file could not carry, and the first auto-fill's 600 s cap, which
   the model worked around with the explicit tool. Versus plain (71 min, 1209
   lines, 338 hand leaves, 0 ATP): slower, shorter proof, same verdict.
+- **Pass 1 (2026-11-08/09, six problems x two arms, one rep): 3/6 each, same
+  set.** Full analysis in `docs/pass1-analysis-2026-11-10.md`; literature and
+  pipeline proposal in `docs/research-pipeline-2026-11-10.md`. Harness fixes
+  that followed (2026-11-10): give-up detection after 3 consecutive stops,
+  frozen statements protected at write time, sledgehammer timeout_s capped at
+  90 s with a worded server-timeout result, fill rounds bounded by the
+  remaining wall clock, a STOP file for the worker, compaction at 50 %.
+- **Stage 1 of the closing-automation study (2026-11-10): the staged filler.**
+  Motivated by pass 1's fill profile (73 % closed, most by simp-class methods
+  bought with 30 s of sledgehammer each; failed rows said only `none`; no
+  Isar proof in 921 fills; false leaves indistinguishable from hard ones), the
+  Pool Server's `fill_sorries` now runs per sorry: try0 (5 s/method) -> nitpick
+  on failure (10 s; `false` + counterexample) -> sledgehammer (30 s) -> isar
+  retry when a proof did not reconstruct -> intro-split of conj/all/imp/iff/ball
+  goals with a second pass on the leaves; two sibling sessions share the work.
+  Live on one 4-sorry job: 66 s, two by try0 with no hammer time, one `false`,
+  one conjunction split 2/2. Reportable measurement: rerun `skeleton_forced`
+  on all six problems as rep 1 and compare with rep 0 on fills proved, hammer
+  seconds per closed leaf, wall clock, tokens and solve set; `fill_stages` in
+  the results rows says what each stage contributed.
 - **Harness: a failed (not timed-out) check was reported as "still running
   line False".** The LSP MCP computes `stuck_line` as `timed_out and commands
   and next(...)`, so a plain failure returns `False`; `isinstance(False,

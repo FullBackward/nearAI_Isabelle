@@ -1028,7 +1028,7 @@ def cmd_queue_status(args) -> int:
     c = Counter((r["arm"], r["status"]) for r in rows)
     arms = sorted({r["arm"] for r in rows})
     for arm in arms:
-        parts = ", ".join(f"{s}={c[(arm, s)]}" for s in ("todo", "running", "solved", "failed", "timeout", "disproved") if c[(arm, s)])
+        parts = ", ".join(f"{s}={c[(arm, s)]}" for s in ("todo", "running", "solved", "failed", "timeout", "gave_up", "disproved") if c[(arm, s)])
         print(f"{arm:14s} {parts}")
     if args.verbose:
         for r in rows:
