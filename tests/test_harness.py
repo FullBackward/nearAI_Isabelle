@@ -647,3 +647,24 @@ def test_leaf_rejection_and_open_fill_rows_tell_the_model_to_restate(tmp_path):
     # a plain-arm summary (no leaf rule) carries no such instruction
     at2, b2, reg2 = make(tmp_path, arm="plain")
     assert "NEXT:" not in rs._fill_summary(at2, d)
+
+
+def test_prompt_says_no_limits_in_both_arms_and_in_the_nudge(tmp_path):
+    """Upstream's no-limits language, dropped in pass 1, is back (2026-11-10):
+    in the system prompt of every arm and in the nudge. The prompt fingerprint
+    in the results row changes with the wording."""
+    at0, b, _ = make(tmp_path)
+    seen = set()
+    for arm in ("plain", "skeleton_forced"):
+        at = rs._Attempt(at0.entry, "wsolution", ARMS[arm], tmp_path, b, True)
+        txt = rs._system_prompt(at)
+        assert "# You have NO limits" in txt and "NO turn limit" in txt
+        assert "never ration your effort" in txt and "harness owns the wall clock" in txt
+        sha = rs.prompt_sha(at)
+        assert sha and len(sha) == 12
+        seen.add(sha)
+        nudge = rs._nudge(at)
+        assert "NO turn limit and NO time limit" in nudge and "You are doing well" in nudge
+        assert nudge.endswith("Continue now, with a tool call.")
+    assert len(seen) == 2          # the two arms have different prompts
+    assert rs.prompt_sha(None) is None

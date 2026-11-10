@@ -34,6 +34,11 @@ docs/experiment-design.md the design and open decisions.
   allowed there); the model's sledgehammer `timeout_s` is capped at 90 s and a server timeout is
   worded as "too hard as stated, split the goal"; no fill round starts with under 180 s left on
   the wall; `runs/STOP` makes a queue worker finish its row and exit (`imo2026_pass.py stop`).
+  The prompt, the first user message and the nudge carry upstream's no-limits language (no
+  turn limit, no token budget, a wall clock the harness owns and the model cannot manage);
+  `prompt_sha(at)` fingerprints the rendered system prompt into every results row, so a
+  wording change is a visible condition, not a silent one. `docs/prompts/` holds the rendered
+  prompts; regenerate them (snippet in its README) after any prompt change.
   Staged filler (IPS 2026-11-10): `fill_stage_options()` (try0 / nitpick / isar / split /
   parallel, env `IB_FILL_*`) goes with every fill call; `_fill_summary` prints the stage per row,
   the goal of every unproved row and a WARNING for nitpick-false statements; `fill_stages` and

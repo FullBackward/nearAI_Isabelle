@@ -149,6 +149,12 @@ heaps built on the server for the purpose; see `runs/bigstep_check_imo2026.log`)
    vs with it (closer to "IPS as shipped plus a prompt").
 3. Budgets: no step cap, 4 h wall clock per attempt; `fill_sorries` 30 s per sorry,
    600 s per job. Upstream: no step cap, 3-day wall clock.
+   The prompt says what upstream's says about limits ("You have NO limits":
+   no turn limit, no token budget, a wall clock the harness owns and the
+   model cannot see or manage) from rep 1 on; pass 1 ran without that section
+   and one plain attempt gave up "in the available time". The results row's
+   `prompt_sha` and `timeout_s` identify the wording and the wall an attempt
+   ran under.
 4. Model: DeepSeek V4 Pro (as upstream's hard tier and the IPS comparison runs)
    vs V4 Flash for cost.
 5. Imports frozen (current) vs allowing extra HOL-distribution imports

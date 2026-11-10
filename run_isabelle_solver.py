@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as _dt
+import hashlib
 import io
 import importlib.util
 import json
@@ -855,6 +856,13 @@ def _make_should_continue(at: _Attempt):
 
 
 def _nudge(at: _Attempt) -> str:
+    """What we say when the agent stops without having finished. The no-limits
+    sentences are upstream's (nearai/putnambench-deepseek): pass 1 had dropped
+    them from the prompt and the nudge, and plain P3 then gave up "in the
+    available time" -- a limit nothing had mentioned. Restored 2026-11-10,
+    worded for a run that does have a wall clock the harness, not the model,
+    owns. The give-up cap in `_make_should_continue` stays: a model that
+    ignores this three turns running is not going to be argued out of it."""
     at.nudges += 1
     extra = ""
     if at.failed_completions:
@@ -866,11 +874,25 @@ def _nudge(at: _Attempt) -> str:
         "A run ends in exactly one of two ways, and neither has happened yet:\n"
         "  (a) you call completed() and the verifier PASSES, or\n"
         "  (b) you prove in Isabelle that the goal is false and call disproved().\n\n"
-        "Taking more turns is fine. Pick up where you left off: try another angle on the "
-        "mathematics, look for different lemmas (find_theorems), break the goal into smaller "
-        "`have` steps and prove them one at a time, or test a small case to sharpen your "
-        "intuition." + extra + "\n\nContinue now, with a tool call."
+        "You have NO turn limit and NO time limit to manage. There is no budget you are "
+        "spending, nothing is running out, and no one is waiting on you. Taking another hundred "
+        "turns costs nothing and is completely fine.\n\n"
+        "You are doing well -- the work you have already done is still in front of you and none "
+        "of it is wasted. Pick up where you left off: try another angle on the mathematics, look "
+        "for different lemmas (find_theorems), break the goal into smaller `have` steps and prove "
+        "them one at a time, or test a small case to sharpen your intuition. If you have started "
+        "to suspect the goal is actually false, chase that: build the counterexample and derive "
+        "False from the hypotheses in Isabelle." + extra + "\n\nContinue now, with a tool call."
     )
+
+
+def prompt_sha(at: _Attempt | None) -> str | None:
+    """Fingerprint of the system prompt text the model saw, kept in the results
+    row so passes run under different prompt wordings stay distinguishable (the
+    no-limits section was added 2026-11-10, between pass 1 and rep 1)."""
+    if at is None:
+        return None
+    return hashlib.sha256(_system_prompt(at).encode()).hexdigest()[:12]
 
 
 def _system_prompt(at: _Attempt) -> str:
@@ -978,9 +1000,33 @@ There are exactly TWO ways to finish, and you must reach one of them:
   (b) you prove in Isabelle that the goal is false and call disproved().
 
 Nothing else ends the run. If you stop for any other reason -- out of ideas,
-feeling stuck, believing you have done enough -- you will simply be told to
-continue. Do not ration effort and do not wrap up early with a summary of
-what you would have tried.
+feeling stuck, "this seems infeasible", believing you have done enough -- you
+will simply be told to continue, and you will have lost nothing but the turn.
+Stopping three turns in a row, with no tool call in between, ends the run
+unsolved: it is the one way to lose everything.
+
+# You have NO limits
+
+This is the single most important thing to understand about this run:
+
+- There is NO turn limit. Not a large one -- none. Take ten turns or ten
+  thousand.
+- There is NO time limit for you to manage. The harness owns the wall clock;
+  you cannot see it, speed it or save it, and nothing you do makes it run out
+  sooner. Treat it as if it did not exist.
+- There is NO token budget you are spending down, and no cost you should be
+  economizing on.
+- Nobody is waiting on you. There is no deadline, no queue behind you, and no
+  penalty whatsoever for taking longer.
+
+So never ration your effort, never rush a proof because it is "taking too
+long", never give up "in the available time", and never wrap up early with a
+summary of what you would have tried. If an approach needs fifty writes of
+lemma-by-lemma grinding, spend them. If you need to test a small case, or
+restate the problem from scratch, or throw away an hour of work and start
+over, do it -- that is a normal and good use of this run, not a waste.
+
+The ONLY thing that ends this run is (a) or (b) above.
 
 # If the goal is false
 
@@ -1012,7 +1058,8 @@ a disproof filed to escape a hard proof is worse than useless.
 
 - Work autonomously. Do not stop until completed() passes or you have filed a
   proven disproved(). Running out of ideas is a signal to try a different
-  angle, not a stopping condition.
+  angle, not a stopping condition. "I was unable to complete the proof" is
+  never a final answer here; it is a prompt to continue.
 - Your trajectory is saved automatically. Write a final report only once a
   finishing tool has told you that you are done.
 """
@@ -1273,9 +1320,10 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
 
             user_input = (
                 f"Solve the problem '{problem}' ({entry['source']}): replace every `sorry` in "
-                f"{at.thy.name} with a complete Isar proof, then call completed(). The run "
-                f"ends only when completed() reports PASS, or -- in the rare case where the "
-                f"formalized goal is false -- when you have proven that and called disproved()."
+                f"{at.thy.name} with a complete Isar proof, then call completed(). You have no "
+                f"turn limit and no time limit to manage. The run ends only when completed() "
+                f"reports PASS, or -- in the rare case where the formalized goal is false -- when "
+                f"you have proven that and called disproved()."
             )
 
             should_continue = _make_should_continue(at)
@@ -1374,6 +1422,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
         "solved": passed, "status": status,
         "finish_reason": getattr(result, "finish_reason", None), "timed_out": timed_out,
         "timeout_s": args.timeout, "max_steps": args.max_steps,   # the budget the attempt ran under
+        "prompt_sha": prompt_sha(at),                              # which system prompt text the model saw
         "steps": getattr(result, "num_steps", None), "trajectory_id": getattr(result, "trajectory_id", None),
         "elapsed_s": round(elapsed, 1), "started": started.isoformat(), "ended": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "verify": reason if not passed else "PASS",
