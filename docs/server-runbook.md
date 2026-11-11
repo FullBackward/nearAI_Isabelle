@@ -381,6 +381,39 @@ cd ~/nearAI_Isabelle && git pull && .venv/bin/python -m pytest -q tests
 .venv/bin/python scripts/imo2026_pass.py launch --timeout 28800
 ```
 
+### 5d. The Putnam pass (2026-11-11): a fixed draw, both arms, 2 h wall
+
+The draw is committed: `subsets/putnam36.txt`, 36 PutnamBench problems, three
+per slot A1-A6 and B1-B6, by `ib.py select --source putnambench --stratify
+category --n 36 --seed 1` with no other exclusion (owner's choice: switch the
+problem set, do not pick problems for a property). 21 of the 36 are
+determine-the-answer problems; the harness inlines the answer (`wsolution`).
+The server needs the benchmark clone, its manifest and two more heaps first
+(`putnam_1977_b6` imports HOL-Algebra.Group; HOL-Combinatorics is in the set's
+other files and cheap):
+
+```bash
+cd ~/nearAI_Isabelle && git pull
+git clone --depth 1 --filter=blob:none --sparse https://github.com/trishullab/PutnamBench benchmarks/putnambench
+(cd benchmarks/putnambench && git sparse-checkout set isabelle)
+.venv/bin/python harness/ib.py prepare --source putnambench --root benchmarks/putnambench/isabelle
+.venv/bin/python harness/ib.py prepare --source imo2026 --root problems/imo2026/isabelle   # keep the IMO rows
+isabelle build -b HOL-Algebra HOL-Combinatorics     # server idle; minutes, not the HOL-Analysis hour
+curl -s localhost:8000/api/v1/heaps/available
+# the pass: --source and --subset go before the subcommand
+.venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt init
+.venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt launch --timeout 7200
+.venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt status
+.venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt report
+# after rep 0: one more rep where it can change the conclusion
+.venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt repeat --unsolved --rep 1
+```
+
+The results file is shared with the IMO rows; `--source` filters every
+command to its own rows. The 2 h wall is a guess from the solved IMO
+attempts (31 to 178 min); raise it if the report shows timeouts on slots the
+plain arm otherwise closes.
+
 ## 6. Results
 
 ```bash

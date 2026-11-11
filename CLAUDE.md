@@ -34,6 +34,8 @@ docs/experiment-design.md the design and open decisions.
   allowed there); the model's sledgehammer `timeout_s` is capped at 90 s and a server timeout is
   worded as "too hard as stated, split the goal"; no fill round starts with under 180 s left on
   the wall; `runs/STOP` makes a queue worker finish its row and exit (`imo2026_pass.py stop`).
+  The pass driver takes `--source` and `--subset` before the subcommand (the Putnam pass runs
+  the committed draw `subsets/putnam36.txt`, 3 per slot, seed 1; see docs/server-runbook.md §5d).
   The prompt, the first user message and the nudge carry upstream's no-limits language (no
   turn limit, no token budget, a wall clock the harness owns and the model cannot manage);
   `prompt_sha(at)` fingerprints the rendered system prompt into every results row, so a

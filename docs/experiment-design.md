@@ -142,6 +142,21 @@ Validation (2026-11-04): all six statement files build via
 `scripts/bigstep_check.py` against the server (HOL-Analysis and HOL-Library
 heaps built on the server for the purpose; see `runs/bigstep_check_imo2026.log`).
 
+## Putnam tier (added 2026-11-11)
+
+Three reps of the six IMO problems gave the same solve set on both arms (P1,
+P4, P5; never P2, P3, P6), so the IMO tier cannot show what closing
+automation buys a bounded model: the arms were never separated. The owner's
+decision is to switch the problem set to PutnamBench rather than select
+problems for a property, so the change can be reported from several
+perspectives (slot, answer type, imports, era) on one draw. `subsets/putnam36.txt`
+is that draw: `ib.py select --source putnambench --stratify category --n 36
+--seed 1`, three problems per slot A1-A6 and B1-B6, no probe exclusions
+(sledgehammer-trivial statements stay in and are reported as such). 21 of
+the 36 carry an answer (inlined by the harness), 20 import only Complex_Main,
+one needs HOL-Algebra. The pass driver takes `--source putnambench --subset
+subsets/putnam36.txt`; the procedure is in `docs/server-runbook.md` §5d.
+
 ## Open decisions (for review)
 
 1. Benchmark: miniF2F-test pilot (recommended) vs a PutnamBench slice first.
