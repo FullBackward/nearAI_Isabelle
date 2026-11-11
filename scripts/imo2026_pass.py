@@ -20,6 +20,17 @@ it only wraps the existing queue (harness/ib.py) and worker
                                                                   # problems no arm has solved; then launch --timeout 28800
     .venv/bin/python scripts/imo2026_pass.py launch
 
+    # another source, a fixed draw: the Putnam pass (2026-11-11; subsets/putnam36.txt is
+    # `ib.py select --source putnambench --stratify category --n 36 --seed 1`, 3 per slot)
+    .venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt init
+    .venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt launch --timeout 7200
+    .venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt report
+
+`--source` and `--subset` are top-level options (before the subcommand): every
+command then reads, queues and reports only that source's rows, and only the
+subset's problems; the repeat/unsolved subset files are named after the source
+(subsets/<source>_repeat.txt, subsets/<source>_unsolved.txt).
+
 Why a queue and one worker: the Pool Server builds one theory at a time and a
 200-sorry fill job already saturates its sledgehammer slots, so a second
 worker would mostly wait. The queue interleaves arms per problem, so a pass
@@ -50,10 +61,11 @@ sys.path.insert(0, str(ROOT))
 from harness import ib  # noqa: E402
 
 ARMS_DEFAULT = ["plain", "skeleton_forced"]
-SOURCE = "imo2026"
+SOURCE = "imo2026"            # overridden by --source (main)
 VARIANT = "wsolution"
 RESULTS = ROOT / "runs" / "results.jsonl"
-SUBSET = ROOT / "subsets" / "imo2026_repeat.txt"
+SUBSET = ROOT / "subsets" / "imo2026_repeat.txt"   # the report's repeat list; renamed with --source
+PROBLEMS: Path | None = None  # --subset: the fixed draw this pass runs (None = every problem of SOURCE)
 IPS_URL = os.environ.get("IPS_URL", "http://localhost:8000")
 
 
@@ -72,7 +84,16 @@ def results_rows(path: Path) -> list[dict]:
 
 
 def problems() -> list[str]:
+    """The pass's problem list: every manifest problem of SOURCE, or, with
+    --subset, exactly the names in that file (a seeded draw committed to the
+    repo, so the Putnam pass is the same 36 problems on every machine)."""
     man = ib.load_manifest()
+    if PROBLEMS is not None:
+        names = [ln.strip() for ln in PROBLEMS.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        bad = [n for n in names if n not in man or man[n]["source"] != SOURCE]
+        if bad:
+            sys.exit(f"{PROBLEMS}: not {SOURCE} problems of the manifest: {bad[:5]}")
+        return names
     return sorted(n for n, e in man.items() if e["source"] == SOURCE)
 
 
@@ -135,8 +156,8 @@ def worker_alive() -> list[str]:
 
 def cmd_init(args) -> int:
     print(f"IPS {IPS_URL}/healthz: {ips_health()}")
-    print(f"problems ({SOURCE}): {', '.join(problems())}")
-    queue_init(args.arms, 1, None)
+    print(f"problems ({SOURCE}{', ' + PROBLEMS.name if PROBLEMS else ''}): {', '.join(problems())}")
+    queue_init(args.arms, 1, PROBLEMS)
     n = sync_queue_from_results(Path(args.results))
     print(f"queue rows settled from results.jsonl: {n}")
     queue_status()
@@ -148,11 +169,11 @@ def cmd_repeat(args) -> int:
         names = unsolved_problems(Path(args.results))
         if not names:
             sys.exit("every problem has been solved by some arm; nothing to repeat")
-        subset = ROOT / "subsets" / "imo2026_unsolved.txt"
+        subset = ROOT / "subsets" / f"{SOURCE}_unsolved.txt"
         subset.parent.mkdir(parents=True, exist_ok=True)
         subset.write_text("\n".join(names) + "\n", encoding="utf-8")
     else:
-        subset = None if args.all else Path(args.subset)
+        subset = PROBLEMS if args.all else Path(args.repeat_list or SUBSET)
         if subset and not subset.exists():
             sys.exit(f"{subset} not found: run `report` first, or pass --all / --unsolved")
     if args.rep is not None:
@@ -329,8 +350,13 @@ def cmd_report(args) -> int:
 # ---- main ---------------------------------------------------------------- #
 
 def main() -> int:
+    global SOURCE, SUBSET, PROBLEMS
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--results", default=str(RESULTS))
+    p.add_argument("--source", default=SOURCE, choices=["imo2026", "putnambench", "minif2f"],
+                   help="the manifest source this pass runs and reports (default: %(default)s)")
+    p.add_argument("--subset", default=None,
+                   help="a file of problem names: the pass runs and reports exactly these (e.g. subsets/putnam36.txt)")
     p.add_argument("--arms", default=",".join(ARMS_DEFAULT), type=lambda v: [a for a in v.replace(" ", ",").split(",") if a],
                    help="comma-separated arms (default: %(default)s); a list would swallow the subcommand")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -338,7 +364,10 @@ def main() -> int:
     s.set_defaults(fn=cmd_init)
     s = sub.add_parser("repeat", help="queue reps 1..N-1 of the repeat subset (or --all); or --rep R for exactly one rep")
     s.add_argument("n", type=int, nargs="?", default=None)
-    s.add_argument("--all", action="store_true"); s.add_argument("--subset", default=str(SUBSET))
+    s.add_argument("--all", action="store_true")
+    # dest differs from the top-level --subset (the pass's draw) so the two do not share args.subset
+    s.add_argument("--subset", dest="repeat_list", default=None,
+                   help="repeat list (default: subsets/<source>_repeat.txt)")
     s.add_argument("--unsolved", action="store_true", help="only the problems no arm has solved (from results.jsonl)")
     s.add_argument("--rep", type=int, default=None, help="queue exactly this rep index for every arm")
     s.set_defaults(fn=cmd_repeat)
@@ -355,6 +384,11 @@ def main() -> int:
     s = sub.add_parser("report", help="per-problem table and the repeat recommendation")
     s.add_argument("--rep", type=int, default=0); s.set_defaults(fn=cmd_report)
     args = p.parse_args()
+    SOURCE = args.source
+    SUBSET = ROOT / "subsets" / f"{SOURCE}_repeat.txt"
+    PROBLEMS = Path(args.subset) if args.subset else None
+    if PROBLEMS is not None and not PROBLEMS.exists():
+        sys.exit(f"--subset {PROBLEMS}: no such file")
     return args.fn(args)
 
 

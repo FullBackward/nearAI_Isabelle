@@ -20,3 +20,6 @@ __pycache__/
 harness/manifest.json
 harness/problems.tsv
 harness/problems.lock
+# derived by the pass driver (report / repeat --unsolved); the committed draws are subsets/putnam36.txt etc.
+subsets/*_repeat.txt
+subsets/*_unsolved.txt
