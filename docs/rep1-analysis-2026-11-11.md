@@ -188,3 +188,31 @@ attempt to watch.
 
 H1 to H4 are each a few lines and should go in before rep 2; I1 is the one
 IPS change that costs the model turns today.
+
+## 7. The three runs side by side
+
+One attempt per problem; the latest row per (problem, arm, rep) in `runs-server/rep1/results.jsonl` (plain P1 is the hand-launched 2026-11-05 run that replaced an aborted first try). Prompt tokens count every call's full context; the bracketed figure is the part DeepSeek did not serve from cache, which is what the run cost.
+
+| run | problem | status | wall min | model calls | writes (rejected) | sledgehammer found/calls | fills: proved/sorries | nudges | prompt tok M (uncached k) | completion tok k |
+|---|---|---|---|---|---|---|---|---|---|---|
+| plain r0 | P1 | solved | 71 | 196 | 2 (0) | 0/0 | - | 0 | 25.4 (100) | 182 |
+| plain r0 | P2 | timeout | 240 | 345 | 42 (0) | 0/13 | - | 17 | 112.8 (169) | 701 |
+| plain r0 | P3 | timeout | 240 | 895 | 30 (0) | 1/12 | - | 489 | 407.8 (209) | 589 |
+| plain r0 | P4 | solved | 39 | 55 | 7 (0) | 0/0 | - | 0 | 5.2 (38) | 152 |
+| plain r0 | P5 | solved | 31 | 80 | 4 (1) | 0/0 | - | 0 | 9.2 (65) | 175 |
+| plain r0 | P6 | timeout | 240 | 674 | 56 (2) | 2/42 | - | 425 | 303.7 (213) | 451 |
+| **plain r0** | **all** | **3/6** | **861** | **2245** | **141 (3)** | **3/67** | **-** | **931** | **864.1 (794)** | **2250** |
+| forced r0 (fixed filler) | P1 | solved | 104 | 177 | 12 (1) | - | 5: 231/338 | 0 | 24.7 (175) | 216 |
+| forced r0 (fixed filler) | P2 | timeout | 240 | 180 | 79 (7) | - | 54: 31/95 | 7 | 34.6 (80) | 245 |
+| forced r0 (fixed filler) | P3 | timeout | 240 | 118 | 29 (4) | - | 22: 94/203 | 8 | 32.4 (118) | 392 |
+| forced r0 (fixed filler) | P4 | solved | 116 | 99 | 17 (2) | - | 6: 220/254 | 0 | 15.5 (107) | 234 |
+| forced r0 (fixed filler) | P5 | solved | 58 | 24 | 15 (1) | - | 6: 163/186 | 0 | 2.8 (67) | 152 |
+| forced r0 (fixed filler) | P6 | timeout | 240 | 160 | 29 (5) | - | 21: 181/346 | 29 | 36.1 (67) | 316 |
+| **forced r0 (fixed filler)** | **all** | **3/6** | **998** | **758** | **181 (20)** | **-** | **114: 920/1422** | **44** | **146.0 (613)** | **1555** |
+| forced r1 (staged filler) | P1 | solved | 178 | 192 | 25 (5) | - | 10: 431/505 | 0 | 29.0 (163) | 310 |
+| forced r1 (staged filler) | P2 | timeout | 240 | 139 | 17 (2) | - | 28: 2/54 | 4 | 25.6 (49) | 278 |
+| forced r1 (staged filler) | P3 | gave up | 151 | 174 | 25 (3) | - | 13: 151/249 | 13 | 47.7 (157) | 340 |
+| forced r1 (staged filler) | P4 | solved | 54 | 113 | 4 (1) | - | 2: 189/193 | 0 | 9.7 (52) | 144 |
+| forced r1 (staged filler) | P5 | solved | 66 | 42 | 13 (4) | - | 5: 252/280 | 0 | 6.7 (153) | 227 |
+| forced r1 (staged filler) | P6 | gave up | 213 | 157 | 42 (9) | - | 29: 383/459 | 11 | 62.8 (224) | 550 |
+| **forced r1 (staged filler)** | **all** | **3/6** | **902** | **817** | **126 (24)** | **-** | **87: 1408/1740** | **28** | **181.5 (798)** | **1850** |
