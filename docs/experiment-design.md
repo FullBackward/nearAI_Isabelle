@@ -253,7 +253,8 @@ its first `completed()`; the file it submitted (854 lines, 3 metis calls, no
   lines, 338 hand leaves, 0 ATP): slower, shorter proof, same verdict.
 - **Pass 1 (2026-11-08/09, six problems x two arms, one rep): 3/6 each, same
   set.** Full analysis in `docs/pass1-analysis-2026-11-10.md`; literature and
-  pipeline proposal in `docs/research-pipeline-2026-11-10.md`. Harness fixes
+  pipeline proposal in `AutoDecompose/docs/research-pipeline-2026-11-10.md`
+  (moved there with its surveys on 2026-11-11). Harness fixes
   that followed (2026-11-10): give-up detection after 3 consecutive stops,
   frozen statements protected at write time, sledgehammer timeout_s capped at
   90 s with a worded server-timeout result, fill rounds bounded by the
