@@ -950,7 +950,10 @@ def cmd_queue_init(args) -> int:
         rows = _read_rows()
         have = {(r["problem"], r["arm"], r["variant"], r["rep"]) for r in rows}
         n = 0
-        for rep in range(args.repeats):
+        # `reps`: explicit rep indices (the pass driver's `repeat --rep R`);
+        # otherwise reps 0..repeats-1 as before.
+        reps = list(getattr(args, "reps", None) or range(args.repeats))
+        for rep in reps:
             for arm in args.arm:
                 for name in names:
                     key = (name, arm, args.variant, str(rep))

@@ -16,6 +16,8 @@ it only wraps the existing queue (harness/ib.py) and worker
     # stage 2: repeats where the report says they are worth it
     .venv/bin/python scripts/imo2026_pass.py repeat 3             # reps 1..2 of the problems in subsets/imo2026_repeat.txt
     .venv/bin/python scripts/imo2026_pass.py repeat 3 --all       # ... or of every problem
+    .venv/bin/python scripts/imo2026_pass.py repeat --unsolved --rep 2   # one new rep (rep 2), both arms, only the
+                                                                  # problems no arm has solved; then launch --timeout 28800
     .venv/bin/python scripts/imo2026_pass.py launch
 
 Why a queue and one worker: the Pool Server builds one theory at a time and a
@@ -105,10 +107,17 @@ def sync_queue_from_results(path: Path) -> int:
     return n
 
 
-def queue_init(arms: list[str], repeats: int, subset: Path | None) -> None:
+def queue_init(arms: list[str], repeats: int, subset: Path | None, reps: list[int] | None = None) -> None:
     ib.cmd_queue_init(SimpleNamespace(source=SOURCE, category=None, with_answer=False, no_answer=False,
                                       subset=str(subset) if subset else None, arm=arms,
-                                      variant=VARIANT, repeats=repeats))
+                                      variant=VARIANT, repeats=repeats, reps=reps))
+
+
+def unsolved_problems(results: Path) -> list[str]:
+    """The problems no arm has solved in any results row: the ones worth a
+    rerun when nothing in the mechanism changed (owner, 2026-11-11)."""
+    solved = {r["problem"] for r in results_rows(results) if r.get("solved")}
+    return [p for p in problems() if p not in solved]
 
 
 def queue_status() -> None:
@@ -135,13 +144,29 @@ def cmd_init(args) -> int:
 
 
 def cmd_repeat(args) -> int:
-    subset = None if args.all else Path(args.subset)
-    if subset and not subset.exists():
-        sys.exit(f"{subset} not found: run `report` first, or pass --all")
-    if subset:
-        names = [ln.strip() for ln in subset.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        print(f"repeating {args.n}x: {', '.join(names)}")
-    queue_init(args.arms, args.n, subset)
+    if args.unsolved:
+        names = unsolved_problems(Path(args.results))
+        if not names:
+            sys.exit("every problem has been solved by some arm; nothing to repeat")
+        subset = ROOT / "subsets" / "imo2026_unsolved.txt"
+        subset.parent.mkdir(parents=True, exist_ok=True)
+        subset.write_text("\n".join(names) + "\n", encoding="utf-8")
+    else:
+        subset = None if args.all else Path(args.subset)
+        if subset and not subset.exists():
+            sys.exit(f"{subset} not found: run `report` first, or pass --all / --unsolved")
+    if args.rep is not None:
+        # exactly one new rep, every arm: the 8 h pass (rep 2) on the unsolved
+        # problems only, both arms, so the budget is the one thing that changes
+        print(f"queueing rep {args.rep} of: {', '.join(names) if args.unsolved else (subset or 'every problem')}")
+        queue_init(args.arms, 0, subset, reps=[args.rep])
+    else:
+        if args.n is None:
+            sys.exit("repeat needs N (reps 1..N-1) or --rep R")
+        if subset:
+            names = [ln.strip() for ln in subset.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            print(f"repeating {args.n}x: {', '.join(names)}")
+        queue_init(args.arms, args.n, subset)
     n = sync_queue_from_results(Path(args.results))
     print(f"queue rows settled from results.jsonl: {n}")
     queue_status()
@@ -311,8 +336,11 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("init", help="queue rep 0 of every problem on each arm; settle rows already in results.jsonl")
     s.set_defaults(fn=cmd_init)
-    s = sub.add_parser("repeat", help="queue reps 1..N-1 of the repeat subset (or --all)")
-    s.add_argument("n", type=int); s.add_argument("--all", action="store_true"); s.add_argument("--subset", default=str(SUBSET))
+    s = sub.add_parser("repeat", help="queue reps 1..N-1 of the repeat subset (or --all); or --rep R for exactly one rep")
+    s.add_argument("n", type=int, nargs="?", default=None)
+    s.add_argument("--all", action="store_true"); s.add_argument("--subset", default=str(SUBSET))
+    s.add_argument("--unsolved", action="store_true", help="only the problems no arm has solved (from results.jsonl)")
+    s.add_argument("--rep", type=int, default=None, help="queue exactly this rep index for every arm")
     s.set_defaults(fn=cmd_repeat)
     s = sub.add_parser("launch", help="start one detached worker that drains the queue (spends money)")
     s.add_argument("--owner", default=f"imo-{time.strftime('%m%d-%H%M')}")

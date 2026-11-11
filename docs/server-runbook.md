@@ -374,9 +374,11 @@ pkill -f server.app.main; sleep 5; pgrep -af poly || echo "no stray prover"
 setsid nohup python -m server.app.main > logs/server.stdout.log 2>&1 < /dev/null &
 sleep 90; curl -s localhost:8000/healthz
 cd ~/nearAI_Isabelle && git pull && .venv/bin/python -m pytest -q tests
-# stage 1 rerun: the forced arm once more on all six, as rep 1
-.venv/bin/python scripts/imo2026_pass.py --arms skeleton_forced repeat 2 --all
-.venv/bin/python scripts/imo2026_pass.py launch
+# stage 2 (after rep 1, 2026-11-11): the 8 h wall on the problems no arm has
+# solved, both arms, one new rep -- the solved ones are not rerun because the
+# mechanism did not change
+.venv/bin/python scripts/imo2026_pass.py repeat --unsolved --rep 2
+.venv/bin/python scripts/imo2026_pass.py launch --timeout 28800
 ```
 
 ## 6. Results
