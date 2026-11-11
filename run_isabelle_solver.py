@@ -48,6 +48,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+
 import agentlib
 from harness import leaves
 from harness.arms import ARMS, FILL_TOOLS, SOLVER_SOURCE_TOOLS, Arm
@@ -95,7 +97,12 @@ def fill_stage_options() -> dict:
             "split": FILL_SPLIT, "parallel": FILL_PARALLEL}
 GIVE_UP_STOPS = 3             # consecutive turns without a tool call that end the attempt
 SLEDGEHAMMER_MAX_S = 90       # cap on the model's per-goal sledgehammer timeout_s
-ATTEMPT_TIMEOUT_S = 180       # multi_attempt / run_code per candidate
+ATTEMPT_TIMEOUT_S = 180       # multi_attempt / run_code per candidate; also the cap on the model's own `timeout`
+# The server's fill_sorries schema (fill_models.py) rejects values outside
+# these ranges with a 422 the model cannot act on (rep 1: eight such calls,
+# try0_s 90..120 and timeout_s 600); the wrapper clamps and says so instead.
+FILL_CAPS = {"timeout_s": (1, 300), "try0_s": (0, 60), "nitpick_s": (0, 120),
+             "max_total_s": (60, 3600), "parallel": (1, FILL_PARALLEL)}
 # Wall budget for the session's check of the whole file after a write. The
 # MCP default (120 s) was too short for an 850-line file; isabelle-humanize
 # needed 600 s for the IMO P1 theory class. A check that expires is reported
@@ -528,12 +535,22 @@ def _register_file_tools(reg: agentlib.ToolRegistry, at: _Attempt) -> None:
 
 
 def _collect_fill(at: _Attempt, first: str, max_total_s: int = FILL_MAX_TOTAL_S) -> dict:
-    """Wait for a fill job that returned `continuing: true`."""
+    """Wait for a fill job that returned `continuing: true`: for the job's own
+    budget (plus the server's grace), never past the attempt's wall. Rep 1
+    (P3): a job asked for with max_total_s=3600 was waited for 720 s, then
+    its snapshot was summarised as a verdict with the untried main statements
+    `skipped`, while the job ran on. A job still running when the wait ends
+    is cancelled (it would hold prover slots and collide with the next
+    write's fill) and the summary says what was never tried."""
     try:
         d = json.loads(first)
     except (TypeError, ValueError):
         return {"raw": first}
-    deadline = time.time() + max_total_s + 120
+    t0 = time.time()
+    deadline = t0 + max_total_s + 120
+    remaining = at.remaining_s()
+    if remaining is not None:
+        deadline = min(deadline, t0 + max(0.0, remaining - 60))
     while isinstance(d, dict) and d.get("continuing") and time.time() < deadline:
         time.sleep(5)
         raw = at.mcp("isabelle_fill_status", {})
@@ -541,6 +558,9 @@ def _collect_fill(at: _Attempt, first: str, max_total_s: int = FILL_MAX_TOTAL_S)
             d = json.loads(raw)
         except (TypeError, ValueError):
             return {"raw": raw}
+    if isinstance(d, dict) and d.get("continuing"):
+        at.mcp("isabelle_fill_cancel", {})
+        d["cut_after_s"] = round(time.time() - t0)
     return d
 
 
@@ -557,9 +577,19 @@ def _fill_summary(at: _Attempt, d: dict) -> str:
     false_rows = [r for r in res if r.get("outcome") == "false"]
     at.fill_false += len(false_rows)
     stages = d.get("stages") or {}
+    pending = [r for r in res if r.get("outcome") == "pending"]
     lines = [f"fill_sorries: {len(proved)}/{len(res)} sorry(s) proved"
              + (f" [{', '.join(f'{k} {v}' for k, v in stages.items())}]" if stages else "")
              + (f" (job error: {d.get('error')})" if d.get("error") else "")]
+    if d.get("cut_after_s") is not None:
+        lines[0] += (f" -- the job was still running after {d['cut_after_s']}s and was CANCELLED; "
+                     f"the {len(pending)} line(s) marked pending were never tried: split them into smaller "
+                     "steps and write again")
+    elif d.get("continuing"):
+        lines[0] += (f" -- STILL RUNNING server-side: {len(pending)} line(s) not tried yet (pending); "
+                     "call isabelle_fill_status() to collect the rest")
+    if d.get("clamped"):
+        lines[0] += f" (clamped to the server's ranges: {d['clamped']})"
     for r in res:
         method = r.get("method")
         head = f"  line {r.get('line')}: {r.get('outcome')}"
@@ -575,7 +605,7 @@ def _fill_summary(at: _Attempt, d: dict) -> str:
         lines.append(head)
         if r.get("outcome") not in ("proved",) and r.get("goal"):
             lines.append(f"      goal: {str(r['goal'])[:200]}")
-    open_rows = [r for r in res if r.get("outcome") not in ("proved", "false")]
+    open_rows = [r for r in res if r.get("outcome") not in ("proved", "false", "pending")]
     if open_rows and at.arm.filler_only:
         lines.append("  NEXT: the filler could not close the step(s) above AS STATED, and you may not write "
                      "their closers yourself. Restate them: split each into smaller `have`s (one fact per "
@@ -658,7 +688,11 @@ def _register_mcp_tools(reg: agentlib.ToolRegistry, at: _Attempt, available: lis
                     "(write_file already does this automatically with "
                     f"timeout_s={FILL_TIMEOUT_S} per sorry and a job cap of {FILL_S_PER_SORRY} s "
                     f"per sorry between {FILL_MAX_TOTAL_S} and {FILL_MAX_TOTAL_CEIL_S} s; call this to retry "
-                    "the survivors with a larger timeout_s / max_total_s). " + desc)
+                    "the survivors with a larger timeout_s / max_total_s). Ranges, clamped silently: "
+                    + ", ".join(f"{k} {lo}..{hi}" for k, (lo, hi) in FILL_CAPS.items()) + ". " + desc)
+        if name in ("isabelle_run_code", "isabelle_multi_attempt"):
+            desc += (f" `timeout` is capped at {ATTEMPT_TIMEOUT_S} s: a step that needs longer will not "
+                     "build either; split it or give it the facts it needs.")
 
         def make(n: str):
             def fn(**kwargs):
@@ -670,6 +704,15 @@ def _register_mcp_tools(reg: agentlib.ToolRegistry, at: _Attempt, available: lis
                     kwargs.setdefault("patience_s", FILL_PATIENCE_S)
                     for k, v in fill_stage_options().items():
                         kwargs.setdefault(k, v)
+                    clamped = []
+                    for k, (lo, hi) in FILL_CAPS.items():
+                        try:
+                            v = int(float(kwargs.get(k, lo)))
+                        except (TypeError, ValueError):
+                            v = lo
+                        if v != max(lo, min(hi, v)):
+                            clamped.append(f"{k} {v}->{max(lo, min(hi, v))}")
+                        kwargs[k] = max(lo, min(hi, v))
                     remaining = at.remaining_s()
                     if remaining is not None:
                         if remaining < FILL_MIN_REMAINING_S:
@@ -677,9 +720,11 @@ def _register_mcp_tools(reg: agentlib.ToolRegistry, at: _Attempt, available: lis
                                     "not enough for a sledgehammer round.")
                         kwargs["max_total_s"] = max(60, min(int(kwargs["max_total_s"]), int(remaining - 120)))
                     raw = at.mcp(n, kwargs)
-                    d = _collect_fill(at, raw)
+                    d = _collect_fill(at, raw, int(kwargs["max_total_s"]))
                     if "raw" in d:
                         return d["raw"]
+                    if clamped:
+                        d["clamped"] = ", ".join(clamped)
                     summary = _fill_summary(at, d)
                     patched = d.get("patched_text")
                     if isinstance(patched, str) and d.get("filled"):
@@ -695,6 +740,21 @@ def _register_mcp_tools(reg: agentlib.ToolRegistry, at: _Attempt, available: lis
                     if isinstance(patched, str) and d.get("filled"):
                         at.sanctioned |= extract_solver_calls(patched)
                     return _fill_summary(at, d) + ("\n\npatched_text:\n" + patched if patched and d.get("filled") else "")
+                if n in ("isabelle_run_code", "isabelle_multi_attempt"):
+                    # Rep 1: P2 spent 74 min in twelve scratch runs of 300..600 s,
+                    # P6 16 min in one multi_attempt of four `smt` candidates at
+                    # 300 s. The MCP default (ATTEMPT_TIMEOUT_S) is the cap too.
+                    try:
+                        kwargs["timeout"] = min(float(kwargs.get("timeout") or ATTEMPT_TIMEOUT_S), ATTEMPT_TIMEOUT_S)
+                    except (TypeError, ValueError):
+                        kwargs["timeout"] = ATTEMPT_TIMEOUT_S
+                    raw = at.mcp(n, kwargs)
+                    if re.search(r'timed out \(still running|"timed_out": true', raw):
+                        raw += (f"\n\nNOTE: that ran for the cap of {ATTEMPT_TIMEOUT_S}s and did not finish. "
+                                "A longer timeout is not available and would not help: a step this slow "
+                                "will not build either. Treat it as too hard as stated -- split it into "
+                                "smaller steps or give it the facts it needs with `using`.")
+                    return raw
                 if n == "isabelle_sledgehammer":
                     # Pass 1: the model escalated timeout_s to 120..300 after
                     # failures (plain P6: 42 calls, 114 min, 2 found); the server
@@ -884,6 +944,21 @@ def _nudge(at: _Attempt) -> str:
         "to suspect the goal is actually false, chase that: build the counterexample and derive "
         "False from the hypotheses in Isabelle." + extra + "\n\nContinue now, with a tool call."
     )
+
+
+def fetch_symbols(gym_url: str, timeout: float = 10.0) -> dict | None:
+    """The Pool Server's symbol table (`GET /api/v1/symbols`: `{"\\<le>": "≤",
+    ...}`), or None when the server does not answer or has no table."""
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.get(f"{gym_url.rstrip('/')}/api/v1/symbols")
+            r.raise_for_status()
+            d = r.json()
+    except Exception as e:  # noqa: BLE001 - never fatal; the keys fall back to literal
+        print(f"[harness] symbols: fetch failed ({type(e).__name__}: {e})", flush=True)
+        return None
+    table = d.get("symbols") if isinstance(d, dict) else None
+    return table if isinstance(table, dict) and table else None
 
 
 def prompt_sha(at: _Attempt | None) -> str | None:
@@ -1293,6 +1368,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
     started = _dt.datetime.now(_dt.timezone.utc)
     t0 = time.time()
     usage_mark = len(agentlib.USAGE_LOG)
+    transcript: _Transcript | None = None
     result = None
     timed_out = False
     setup_error: str | None = None
@@ -1385,6 +1461,7 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
         reason = (setup_error or report.strip().splitlines()[-1] if report.strip() else "")
 
     usage_rows = agentlib.USAGE_LOG[usage_mark:]
+    length_turns = sum(1 for c in (transcript.calls if transcript is not None else []) if c.get("finish") == "length")
     tokens = {
         "prompt": sum(u["prompt_tokens"] for u in usage_rows),
         "completion": sum(u["completion_tokens"] for u in usage_rows),
@@ -1423,6 +1500,8 @@ def _solve_one(problem: str, arm_name: str, variant: str, rep: int, args) -> str
         "finish_reason": getattr(result, "finish_reason", None), "timed_out": timed_out,
         "timeout_s": args.timeout, "max_steps": args.max_steps,   # the budget the attempt ran under
         "prompt_sha": prompt_sha(at),                              # which system prompt text the model saw
+        "symbols": leaves.symbols_in_use(),                        # server symbol table behind the leaf rule (0 = literal keys)
+        "length_turns": length_turns,                              # model turns cut at the provider's output ceiling
         "steps": getattr(result, "num_steps", None), "trajectory_id": getattr(result, "trajectory_id", None),
         "elapsed_s": round(elapsed, 1), "started": started.isoformat(), "ended": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "verify": reason if not passed else "PASS",
@@ -1488,6 +1567,13 @@ def main() -> int:
         return 2
 
     owner = args.owner or f"{socket.gethostname()}-{os.getpid()}"
+
+    # The leaf rule compares text the way Isabelle reads it: the server's own
+    # symbol table (its etc/symbols), fetched once per worker; without it the
+    # keys are literal and the log says so (docs/rep1-analysis-2026-11-11.md H4).
+    n_sym = leaves.set_symbols(fetch_symbols(GYM_URL))
+    print(f"[harness] symbols: {n_sym} from {GYM_URL}" if n_sym else
+          f"[harness] symbols: none from {GYM_URL} (leaf keys compare literally)", flush=True)
 
     if args.problem:
         arm = (args.arm or ["plain"])[0]

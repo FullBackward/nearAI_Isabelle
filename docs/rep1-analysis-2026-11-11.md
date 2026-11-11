@@ -125,6 +125,8 @@ rejected lines; the other 70 lines were closers the model wrote. The fix is a
 symbol-normalising `_norm` in `harness/leaves.py` (the table has 440 entries;
 the server has the same one in `unicode_normaliser.py`).
 
+*Status 2026-11-11: H1 to H4 fixed in the harness (one commit, tests in `tests/test_harness.py`); the leaf rule takes the symbol table from the server's new `GET /api/v1/symbols`, never a copy.*
+
 Verified as working, not defects: the frozen-parts guard (P2, above); the
 give-up cap (P3 and P6 ended on the third consecutive stop, after 13 and 11
 nudges in total, with 1.5 h and 0.5 h left); the leaf rule (71 of 75 rejected
@@ -169,6 +171,8 @@ snapshot uses the same word for "not started yet" as the final result uses
 for "max_total_s ran out before this one" (`reason` tells them apart, the
 label does not). A `pending` outcome for the former would have made H3
 visible to the model.
+
+*Status 2026-11-11: I1 to I3 fixed in IPS (`ada6b6c`, `4b1af9c`; 878 tests, live check on the Docker server). The cause of the dead scratch sessions is still to be read from the server log.*
 
 No 5xx, no 504, no `memory_pressure` refusal and no "verifier unavailable" in
 the two worker logs; the sledgehammer-timeout fixes of 2026-11-09 held. Two

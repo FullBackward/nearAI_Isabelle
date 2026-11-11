@@ -28,9 +28,13 @@ class FakeBridge:
         self.sync = {"synced": True, "success": True, "proof_open": False, "error": None, "stuck_line": None}
         self.fill = {"filled": 0, "n": 0, "continuing": False, "results": [], "patched_text": None}
         self.sh = {"found": True, "results": [{"method": "by (metis add.commute)"}]}
+        self.scripted: dict = {}
 
     def call(self, name, args, timeout=0):
         self.calls.append((name, args))
+        if name in self.scripted:                       # per-test answers, str or callable
+            r = self.scripted[name]
+            return r(args) if callable(r) else r
         if name == "isabelle_sync":
             return json.dumps(self.sync)
         if name == "isabelle_diagnostic_messages":
@@ -668,3 +672,94 @@ def test_prompt_says_no_limits_in_both_arms_and_in_the_nudge(tmp_path):
         assert nudge.endswith("Continue now, with a tool call.")
     assert len(seen) == 2          # the two arms have different prompts
     assert rs.prompt_sha(None) is None
+
+
+# ---- rep-1 fixes (2026-11-11; docs/rep1-analysis-2026-11-11.md H1-H4) ------- #
+
+def test_leaf_rule_compares_symbols_the_way_isabelle_reads_them(tmp_path):
+    """H4: the filler writes `‹x ≤ a n›`, the model re-types `‹x \\<le> a n›`;
+    with the server's table installed they are the same leaf. Without a table
+    the keys are literal (the pre-fix behaviour)."""
+    from harness import leaves
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    filler = THY.replace("  sorry", "  using N_def \u2039x \u2264 a n\u203a by (simp add: le_trans)")
+    typed = THY.replace("  sorry", "  using N_def \\<open>x \\<le> a n\\<close> by (simp add: le_trans)")
+    try:
+        assert leaves.set_symbols({"\\<le>": "\u2264", "\\<open>": "\u2039", "\\<close>": "\u203a"}) == 3
+        at.note_filler_text(json.dumps({"patched_text": filler}))
+        assert reg.invoke("write_file", json.dumps({"content": typed})).startswith("wrote")
+        leaves.set_symbols({})
+        at2, b2, reg2 = make(tmp_path, arm="skeleton_forced")
+        at2.note_filler_text(json.dumps({"patched_text": filler}))
+        assert reg2.invoke("write_file", json.dumps({"content": typed})).startswith("REJECTED")
+    finally:
+        leaves.set_symbols({})
+    assert rs.fetch_symbols("http://127.0.0.1:9", timeout=0.5) is None     # no server: literal keys, no crash
+
+
+def test_fill_options_are_clamped_to_the_server_ranges(tmp_path):
+    """H1: rep 1 sent try0_s 90..120 and timeout_s 600 and got 422s back."""
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    rs._register_mcp_tools(reg, at, _all_tools("skeleton_forced"))
+    out = reg.invoke("isabelle_fill_sorries", json.dumps({"try0_s": 120, "timeout_s": 600, "max_total_s": 5734, "parallel": 4}))
+    sent = [a for n, a in b.calls if n == "isabelle_fill_sorries"][-1]
+    assert sent["try0_s"] == 60 and sent["timeout_s"] == 300 and sent["max_total_s"] == 3600 and sent["parallel"] == rs.FILL_PARALLEL
+    assert "clamped" in out and "try0_s 120->60" in out and "timeout_s 600->300" in out
+
+
+def test_scratch_timeout_is_capped_and_a_timed_out_run_is_worded(tmp_path):
+    """H2: P2 spent 74 min in scratch runs of 300..600 s."""
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    rs._register_mcp_tools(reg, at, _all_tools("skeleton_forced"))
+    b.scripted["isabelle_run_code"] = json.dumps({"success": False, "error": "timed out (still running at line 8)"})
+    out = reg.invoke("isabelle_run_code", json.dumps({"chunk": "lemma x: True by simp", "timeout": 600}))
+    assert b.calls[-1][1]["timeout"] == rs.ATTEMPT_TIMEOUT_S
+    assert "did not finish" in out and "split it" in out
+    b.scripted["isabelle_run_code"] = json.dumps({"success": True})
+    assert "NOTE" not in reg.invoke("isabelle_run_code", json.dumps({"chunk": "lemma y: True by simp"}))
+    assert b.calls[-1][1]["timeout"] == rs.ATTEMPT_TIMEOUT_S           # the default is the cap too
+
+
+class _Clock:
+    def __init__(self): self.t = 1_000_000.0
+    def now(self): return self.t
+    def sleep(self, s): self.t += s
+
+
+def test_collect_fill_waits_for_the_job_budget_then_cancels_and_says_so(tmp_path, monkeypatch):
+    """H3: rep 1 (P3) waited 720 s for a 3600 s job, then printed its snapshot
+    as a verdict with the untried main statements `skipped`."""
+    clock = _Clock()
+    monkeypatch.setattr(rs.time, "time", clock.now)
+    monkeypatch.setattr(rs.time, "sleep", clock.sleep)
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    rows = [{"line": 5, "outcome": "proved", "method": "by simp", "stage": "try0"},
+            {"line": 9, "outcome": "pending", "goal": "V n = 2 ^ n"}]
+    running = json.dumps({"filled": 1, "n": 2, "continuing": True, "results": rows, "patched_text": None})
+    b.scripted["isabelle_fill_status"] = running
+    d = rs._collect_fill(at, running, max_total_s=60)
+    names = [n for n, _ in b.calls]
+    assert names[-1] == "isabelle_fill_cancel" and names.count("isabelle_fill_status") >= 30
+    assert d["cut_after_s"] >= 180
+    text = rs._fill_summary(at, d)
+    assert "CANCELLED" in text and "1 line(s) marked pending" in text and "line 9: pending" in text
+    # the job finishes on the second poll: no cancel, a normal summary
+    polls = iter([running, json.dumps({"filled": 1, "n": 2, "continuing": False,
+                                       "results": [rows[0], {"line": 9, "outcome": "none", "goal": "V n = 2 ^ n"}]})])
+    b.scripted["isabelle_fill_status"] = lambda args: next(polls)
+    b.calls.clear()
+    d = rs._collect_fill(at, running, max_total_s=60)
+    assert "cut_after_s" not in d and "isabelle_fill_cancel" not in [n for n, _ in b.calls]
+    assert "STILL RUNNING" not in rs._fill_summary(at, d)
+
+
+def test_collect_fill_never_waits_past_the_wall(tmp_path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(rs.time, "time", clock.now)
+    monkeypatch.setattr(rs.time, "sleep", clock.sleep)
+    at, b, reg = make(tmp_path, arm="skeleton_forced")
+    at.deadline = clock.now() + 100                     # 100 s left on the wall
+    running = json.dumps({"filled": 0, "n": 1, "continuing": True, "results": [{"line": 5, "outcome": "pending"}]})
+    b.scripted["isabelle_fill_status"] = running
+    d = rs._collect_fill(at, running, max_total_s=3600)
+    assert d["cut_after_s"] <= 45 and [n for n, _ in b.calls][-1] == "isabelle_fill_cancel"

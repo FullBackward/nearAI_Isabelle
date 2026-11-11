@@ -361,7 +361,10 @@ in flight.
 
 The staged filler (2026-11-10) and the sledgehammer-budget fix (2026-11-09)
 live in the IPS checkout and its Scala/ML backend; a restart drops live
-sessions, so do it between attempts:
+sessions, so do it between attempts. A Python-only change (the 2026-11-11
+fixes: ASCII fill text, `pending`, the scratch retry, `/api/v1/symbols`) needs
+the pull and the restart but not `isabelle scala_build`; the MCP side is
+picked up by the next attempt, since the harness spawns it from the checkout:
 
 ```bash
 cd ~/nearAI_Isabelle && .venv/bin/python scripts/imo2026_pass.py stop     # worker finishes its row and exits

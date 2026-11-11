@@ -39,6 +39,15 @@ docs/experiment-design.md the design and open decisions.
   `prompt_sha(at)` fingerprints the rendered system prompt into every results row, so a
   wording change is a visible condition, not a silent one. `docs/prompts/` holds the rendered
   prompts; regenerate them (snippet in its README) after any prompt change.
+  Rep-1 fixes (2026-11-11, docs/rep1-analysis-2026-11-11.md H1-H4): the model's fill options
+  are clamped to the server's ranges (`FILL_CAPS`) and the summary says so; `timeout` on
+  `isabelle_run_code`/`isabelle_multi_attempt` is capped at `ATTEMPT_TIMEOUT_S` and a timed-out
+  run is worded "too hard as stated"; `_collect_fill` waits for the job's own `max_total_s`
+  (never past the wall), cancels a job still running and marks its `pending` rows as never
+  tried; the leaf rule compares Isabelle symbols through the server's own table
+  (`fetch_symbols` -> `leaves.set_symbols`, fetched once per worker in `main`; the results row
+  carries `symbols`, 0 = literal keys). Never keep a symbol table in this repo (owner rule).
+  `length_turns` in the row counts model turns cut at the provider's output ceiling.
   Staged filler (IPS 2026-11-10): `fill_stage_options()` (try0 / nitpick / isar / split /
   parallel, env `IB_FILL_*`) goes with every fill call; `_fill_summary` prints the stage per row,
   the goal of every unproved row and a WARNING for nitpick-false statements; `fill_stages` and

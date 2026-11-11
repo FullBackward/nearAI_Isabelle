@@ -41,17 +41,54 @@ definition idioms the filler cannot produce are whitelisted: the
 `function` package's `by pat_completeness auto` and
 `termination by lexicographic_order` / `size_change`.
 
+Keys compare text the way Isabelle reads it, not byte for byte: the filler
+writes sledgehammer's rendered method (`‹x ≤ a n›`), the model is told to
+write `\\<name>` notation and re-types the same line as `‹x \\<le> a n›`
+(rep 1, 2026-11-11: four of 22 rejections, three of them consecutive turns on
+one P6 line). `set_symbols` takes the table the Pool Server serves at
+`GET /api/v1/symbols` -- Isabelle's own `etc/symbols` of the installed version,
+never a copy kept here (owner rule) -- and `_norm` maps every Unicode symbol in
+it to its `\\<name>` form on both sides of the comparison. Without a table the
+keys are literal, as before, and the harness says so in its log.
+
 Public API:
     leaf_keys(text)            -> set of (enclosing_goal, block) keys for every
                                   method leaf of `text` (what the filler wrote)
     check(text, allowed_keys)  -> list of Violation for every leaf the model
                                   wrote itself
+    set_symbols(table)         -> install the server's {"\\<le>": "≤", ...} table;
+                                  returns the number of symbols in use
     selftest()                 -> raises AssertionError on regression
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+
+# ---- Isabelle symbols (the server's table) --------------------------------- #
+
+_SYMBOLS: dict[str, str] = {}          # unicode char -> \<name>
+_SYMBOL_RE: re.Pattern[str] | None = None
+
+
+def set_symbols(table: dict[str, str] | None) -> int:
+    """Install the server's table (`{"\\<le>": "≤", ...}` as GET /api/v1/symbols
+    returns it; None or {} clears it). Keys are then compared in \\<name>
+    notation. Returns the number of symbols installed."""
+    global _SYMBOLS, _SYMBOL_RE
+    _SYMBOLS = {ch: name for name, ch in (table or {}).items() if isinstance(ch, str) and len(ch) == 1}
+    _SYMBOL_RE = (re.compile("|".join(re.escape(ch) for ch in sorted(_SYMBOLS, key=len, reverse=True)))
+                  if _SYMBOLS else None)
+    return len(_SYMBOLS)
+
+
+def symbols_in_use() -> int:
+    return len(_SYMBOLS)
+
+
+def ascii_symbols(s: str) -> str:
+    """`s` with every symbol of the installed table in \\<name> notation."""
+    return _SYMBOL_RE.sub(lambda m: _SYMBOLS[m.group(0)], s) if _SYMBOL_RE else s
 
 # ---- masking ------------------------------------------------------------- #
 
@@ -151,7 +188,7 @@ class Violation:
 
 
 def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"\s+", " ", ascii_symbols(s)).strip()
 
 
 def _initial_method_ok(rest: str) -> bool:
@@ -311,6 +348,18 @@ end
     assert inner and inner[0][0] == 'lemma j: "A" > have k: "B"', nk
     assert outer and outer[0][0].startswith("lemma j"), nk
     print("leaves selftest: PASSED")
+
+    # the server's symbol table: the filler's line, re-typed in \\<name> notation, is the same leaf
+    before = dict((name, ch) for ch, name in _SYMBOLS.items())
+    try:
+        set_symbols({"\\<le>": "\u2264", "\\<open>": "\u2039", "\\<close>": "\u203a"})
+        filler = 'lemma s: "P"\nproof -\n  have "x \u2264 y"\n    using N_def \u2039x \u2264 a n\u203a by (metis LeastI_ex)\n  show "P" sorry\nqed\n'
+        typed = filler.replace("\u2264", "\\<le>").replace("\u2039", "\\<open>").replace("\u203a", "\\<close>")
+        assert check(typed, leaf_keys(filler)) == [], check(typed, leaf_keys(filler))
+        set_symbols({})
+        assert len(check(typed, leaf_keys(filler))) == 1          # literal keys without a table
+    finally:
+        set_symbols(before)
 
 
 if __name__ == "__main__":
