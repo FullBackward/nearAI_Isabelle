@@ -118,6 +118,7 @@ for i in 1 2; do nohup .venv/bin/python run_isabelle_solver.py --loop 0 > runs/w
 # the same driver on another source and a fixed draw (the Putnam pass, 2026-11-11):
 .venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt init
 .venv/bin/python scripts/imo2026_pass.py --source putnambench --subset subsets/putnam36.txt launch --timeout 7200
+.venv/bin/python scripts/watch.py                   # follow every running attempt: one line per model turn and tool call
 ```
 
 A model that stops without a tool call is nudged, but only twice in a row: the third
