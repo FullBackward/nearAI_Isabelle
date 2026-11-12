@@ -17,6 +17,8 @@ picked up on the next scan. Nothing here touches the queue or the attempts.
     .venv/bin/python scripts/watch.py --once       # the last 15 records of each, then exit
     .venv/bin/python scripts/watch.py --last 40    # start with more history
     .venv/bin/python scripts/watch.py runs/plain/putnam_1962_b3/rep0/transcript.jsonl   # a given file
+    .venv/bin/python scripts/watch.py --reasoning             # plus the model's reasoning, 800 chars a turn
+    .venv/bin/python scripts/watch.py --reasoning 0 --args 0  # everything: full reasoning, full tool arguments
 """
 from __future__ import annotations
 
@@ -49,6 +51,21 @@ def running_transcripts() -> dict[str, Path]:
     return out
 
 
+REASON: int | None = None   # chars of the model's reasoning to print per turn (None = off, 0 = all)
+TOOLARGS: int | None = None  # chars of a tool call's arguments to print (None = off, 0 = all)
+
+
+def block(label: str, text: str, limit: int | None) -> str:
+    """An indented block under a line: the model's reasoning, its text, or a tool's arguments."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if limit:
+        text = text[:limit] + (" [...]" if len(text) > limit else "")
+    body = "\n".join("    | " + ln for ln in text.splitlines())
+    return f"\n    {label}:\n{body}"
+
+
 def fmt(tag: str, rec: dict) -> str | None:
     kind = rec.get("kind")
     t = (rec.get("started") or "")[11:19]
@@ -57,17 +74,25 @@ def fmt(tag: str, rec: dict) -> str | None:
         resp = rec.get("response") or {}
         usage = rec.get("usage") or {}
         fin = rec.get("finish_reason") or "?"
+        content = (resp.get("content") or "").strip()
         head = ""
-        if not resp.get("tool_calls"):
-            head = "  " + json.dumps((resp.get("content") or "").strip()[:90])
-        return (f"{t} {tag:18s} #{n:>4} CHAT  {fin:10s} {float(rec.get('elapsed_s') or 0):6.1f}s"
+        if not resp.get("tool_calls") and REASON is None:
+            head = "  " + json.dumps(content[:90])
+        line = (f"{t} {tag:18s} #{n:>4} CHAT  {fin:10s} {float(rec.get('elapsed_s') or 0):6.1f}s"
                 f"  cmpl {usage.get('completion_tokens', '?')}{head}")
+        if REASON is not None:
+            line += block("reasoning", resp.get("reasoning_content") or "", REASON)
+            line += block("text", content, REASON)
+        return line
     if kind == "tool":
         res = (rec.get("result") or "").replace("\n", " ")
         err = rec.get("error")
         tail = f" !! {err}" if err and err != "None" else ""
-        return (f"{'':8s} {tag:18s} #{n:>4} TOOL  {rec.get('name', '?'):24s} {float(rec.get('elapsed_s') or 0):6.1f}s"
+        line = (f"{'':8s} {tag:18s} #{n:>4} TOOL  {rec.get('name', '?'):24s} {float(rec.get('elapsed_s') or 0):6.1f}s"
                 f" -> {res[:110]}{tail}")
+        if TOOLARGS is not None:
+            line += block("args", rec.get("arguments") or "", TOOLARGS)
+        return line
     return None   # mcp records are the harness's own calls; the tool line already covers them
 
 
@@ -87,7 +112,13 @@ def main() -> int:
     ap.add_argument("--last", type=int, default=15, help="history lines per attempt at start (default 15)")
     ap.add_argument("--once", action="store_true", help="print the history and exit")
     ap.add_argument("--interval", type=float, default=2.0, help="seconds between scans")
+    ap.add_argument("--reasoning", type=int, nargs="?", const=800, default=None, metavar="CHARS",
+                    help="also print the model's reasoning and text per turn (CHARS each, default 800; 0 = all)")
+    ap.add_argument("--args", dest="toolargs", type=int, nargs="?", const=300, default=None, metavar="CHARS",
+                    help="also print each tool call's arguments (CHARS, default 300; 0 = all)")
     args = ap.parse_args()
+    global REASON, TOOLARGS
+    REASON, TOOLARGS = args.reasoning, args.toolargs
 
     offsets: dict[Path, int] = {}
     tags: dict[Path, str] = {}
