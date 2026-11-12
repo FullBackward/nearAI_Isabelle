@@ -51,7 +51,7 @@ import os
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -141,15 +141,37 @@ def unsolved_problems(results: Path) -> list[str]:
     return [p for p in problems() if p not in solved]
 
 
-def queue_status() -> None:
-    ib.cmd_queue_status(SimpleNamespace(verbose=False))
+def pass_rows() -> list[dict]:
+    """The queue rows of this pass: the queue file is shared (IMO rows and the
+    Putnam draw sit in the same TSV), so counts and listings are restricted to
+    the pass's own problems and variant."""
+    wanted = set(problems())
+    with ib._Lock(shared=True):
+        rows = ib._read_rows()
+    return [r for r in rows if r["problem"] in wanted and r.get("variant", VARIANT) == VARIANT]
+
+
+def queue_status(rows: list[dict] | None = None, arms: list[str] | None = None) -> None:
+    rows = pass_rows() if rows is None else rows
+    if arms:
+        rows = [r for r in rows if r["arm"] in arms]
+    c = Counter((r["arm"], r["status"]) for r in rows)
+    for arm in sorted({r["arm"] for r in rows}):
+        parts = ", ".join(f"{s}={c[(arm, s)]}" for s in
+                          ("todo", "running", "solved", "failed", "timeout", "gave_up", "disproved") if c[(arm, s)])
+        print(f"{arm:16s} {parts}")
+    done = [r for r in rows if r["status"] != "todo"]
+    if done:
+        w = max(len(r["problem"]) for r in done) + 1
+        print(f"\n{'problem':{w}s} {'arm':16s} rep status     steps  note")
+        for r in sorted(done, key=lambda r: (int(r["rep"]), r["problem"], r["arm"])):
+            print(f"{r['problem']:{w}s} {r['arm']:16s} {r['rep']:>3s} {r['status']:10s} {r.get('steps') or '':>5s}  "
+                  f"{(r.get('note') or '')[:70]}")
 
 
 def worker_alive() -> list[str]:
-    with ib._Lock(shared=True):
-        rows = ib._read_rows()
     return [f"{r['problem']}/{r['arm']}/rep{r['rep']} pid {r['pid']}"
-            for r in rows if r["status"] == "running" and r["pid"] and ib._pid_alive(r["pid"])]
+            for r in pass_rows() if r["status"] == "running" and r["pid"] and ib._pid_alive(r["pid"])]
 
 
 # ---- commands ------------------------------------------------------------ #
@@ -270,10 +292,12 @@ def cmd_status(args) -> int:
     print(f"model config: {model_config_ok()}")
     alive = worker_alive()
     print("worker: " + ("; ".join(alive) if alive else "none running"))
-    queue_status()
-    rows = results_rows(Path(args.results))
+    queue_status(arms=args.arms)
+    wanted = set(problems())
+    rows = [r for r in results_rows(Path(args.results)) if r["problem"] in wanted]
     if rows:
-        print(f"\nresults.jsonl: {len(rows)} {SOURCE} rows; latest: "
+        print(f"\nresults.jsonl: {len(rows)} rows for this pass ({SOURCE}"
+              f"{', ' + PROBLEMS.name if PROBLEMS else ''}); latest: "
               f"{rows[-1]['problem']} {rows[-1]['arm']} rep{rows[-1]['rep']} -> {rows[-1]['status']}")
     return 0
 
