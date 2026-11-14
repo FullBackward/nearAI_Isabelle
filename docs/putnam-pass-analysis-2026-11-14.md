@@ -3,7 +3,10 @@
 Winston Ren's project; this note by the harness author, 2026-11-14.
 Data: `runs-server/putnam/` (72 attempts of 2026-11-12/13, the 36-problem
 draw `subsets/putnam36.txt`, arms `plain` and `skeleton_forced`, 2 h wall,
-DeepSeek V4 Pro), read with `scripts/analysis/putnam_pass.py`. One attempt
+DeepSeek V4 Pro), read with `scripts/analysis/putnam_pass.py`. Four rows
+(2021 A2 and 2023 A1, both arms) were rejudged `solved` on 2026-11-14 with
+`scripts/rejudge_rows.py` after the build-service outage described in
+Section 1; the counts below include them. One attempt
 per cell, so every number is a single draw; the rep-to-rep spread seen on
 the IMO set (up to 2x on wall) applies here too, and I treat a gap below that
 as noise unless it repeats across problems.
@@ -14,7 +17,7 @@ succeed; and the harness withholds tools (a Python run of examples) that the
 model needs. My reading, stated first.
 
 (i) *The forced arm lost, and the loss is in the filler's blind spot, not in
-the model.* Plain solved 21 of 36, forced 17; on five problems plain solved
+the model.* Plain solved 23 of 36, forced 19; on five problems plain solved
 and forced timed out, on one the reverse (and that one plain attempt was a
 server capacity failure, not a model failure). The forced attempts that
 timed out had the proof largely done: the filler had closed 82 % of the 4 316
@@ -70,21 +73,38 @@ table; the summary:
 
 | arm | solved | disproved | timeout | gave up | failed | mean wall | wall total | completion tokens | uncached prompt |
 |---|---|---|---|---|---|---|---|---|---|
-| plain | 21 | 6 | 6 | 2 | 1 | 53 min | 31.7 h | 5.59 M | 2.61 M |
-| skeleton_forced | 17 | 4 | 15 | 0 | 0 | 78 min | 46.9 h | 5.19 M | 3.35 M |
+| plain | 23 | 6 | 4 | 2 | 1 | 53 min | 31.7 h | 5.59 M | 2.61 M |
+| skeleton_forced | 19 | 4 | 13 | 0 | 0 | 78 min | 46.9 h | 5.19 M | 3.35 M |
 
-Both solved 16; plain only 5 (1963 A6, 1970 A3, 1981 B5, 2015 A3, 2016 B2);
+Both solved 18; plain only 5 (1963 A6, 1970 A3, 1981 B5, 2015 A3, 2016 B2);
 forced only 1 (1968 B6, where plain's attempt never opened a session: the
 Pool Server answered `memory_pressure` eight times in 92 s and the harness
-recorded `failed`); both missed 14, of which 6 are disproofs and 4 are the
-defective statements the forced arm did not disprove in time.
+recorded `failed`); both missed 12: the 6 disproofs (two of which, 2010 A4
+and 2019 A5, the forced arm did not disprove in time) and 6 misses proper
+(1968 A6, 1993 B3, 2007 B6, 2014 B4, 2019 B5, 2023 B1).
 
-By slot and era (solved, plain / forced, of 3 per slot): A1 2/2, A2 2/2,
+**The verifier outage, and the four rejudged rows.** From 2026-11-13 06:57
+the Pool Server's build service was wedged: one bigstep build ran for 29 h
+because a timed-out build was killed by its shell wrapper only, the JVM and
+Poly/ML under it kept the pipes open, the handler never returned, and it
+held the bigstep semaphore (size 1). Every `completed()` and final verify
+after that moment came back "verifier unavailable: the theory was not
+judged", and the harness wrote the row as `timeout`. Four rows were hit,
+2021 A2 and 2023 A1 on both arms, each with a sorry-free file; the attempts
+spent their remaining wall waiting on the dead verifier (the forced 2021 A2
+attempt called `completed` three times). Built on 2026-11-14 after the
+restart, all four PASS in 6 to 10 s and pass the harness's textual checks,
+so they are counted `solved` here (`scripts/rejudge_rows.py` keeps the old
+status in the row). The server fix is IPS c723e06 (kill the process group,
+reap with a bound; `tests/test_kill_build_tree.py`). Their walls and token
+counts stay in the tables as the attempts ran them.
+
+By slot and era (solved, plain / forced, of 3 per slot): A1 3/3, A2 3/3,
 A3 3/1, A4 2/2, A5 2/2, A6 2/1, B1 1/1, B2 3/2, B3 1/1, B4 1/1, B5 2/1, B6
-0/1. The A-side (13/10 of 18) is easier than the B-side (8/7) on both arms,
+0/1. The A-side (15/12 of 18) is easier than the B-side (8/7) on both arms,
 as expected; the forced arm's losses are spread over A3, A6, B2, B5. By era:
-1962-79 6/5 of 10, 1980-99 8/7 of 11, 2000-23 7/5 of 15. Problems importing
-only `Complex_Main` went 16/13 of 20; every problem importing
+1962-79 6/5 of 10, 1980-99 8/7 of 11, 2000-23 9/7 of 15. Problems importing
+only `Complex_Main` went 18/15 of 20; every problem importing
 `HOL-Computational_Algebra` or `HOL-Library` (6) was missed by both arms,
 four of them disproved or defective.
 
@@ -176,7 +196,10 @@ four kinds:
    `((+) 1 ⟶ 2) (at_left 1)` (1981 B5, 147 of 204 closed, two leaves left
    at the wall), `(λr. (x+1) powr (r+1) - x powr (r+1)) has_real_derivative
    ...` (2021 A2). These close by `(auto intro!: tendsto_eq_intros
-   continuous_intros derivative_eq_intros)` and by nothing in try0.
+   continuous_intros derivative_eq_intros)` and by nothing in try0. (The
+   2021 A2 and 2023 A1 attempts went on to close every leaf by restating,
+   and were solved once rejudged; their examples stand as leaves the filler
+   refused at first sight.)
 3. *Algebra the cheap methods do not normalise.* `n*(n+1)*(2n+1) + 6*(Suc n)²
    = Suc n * (Suc n + 1) * (2 * Suc n + 1)` (2023 A1), `(1/2)^(Suc j+2)^2 <
    (1/2)^(j+2)^2` (2014 B4), the `gcd a 2015 = 1 + 4*(if 5 dvd a ...)`
@@ -187,10 +210,11 @@ four kinds:
    goals, so the model was told `none`, not `false`.
 
 Kinds 1 to 3 are the leaves a human closes in one line and the plain model
-did close: in the 21 plain solved proofs the methods are `simp` 1 547, `auto`
-702, `rule` 353, `linarith` 178, with 32 `simp add:` modifiers and 12.6
-`unfolding` lines per proof and 21.8 references to a `*_def`. The 17 forced
-solved proofs have `force` 279, `blast` 255, `meson` 221, `auto` 216,
+did close: in the 21 plain proofs judged solved in the run the methods are
+`simp` 1 547, `auto` 702, `rule` 353, `linarith` 178, with 32 `simp add:`
+modifiers and 12.6 `unfolding` lines per proof and 21.8 references to a
+`*_def`. The 17 forced proofs judged in the run have `force` 279, `blast`
+255, `meson` 221, `auto` 216,
 `fastforce` 183, `metis` 141, with 1.6 `simp add:` per proof. The forced
 proofs are shorter (334 against 453 lines, 110 against 143 leaves) and of a
 different kind, as on the IMO set; but the forced arm can only ever have a
@@ -228,10 +252,12 @@ the 15 h went.
 
 ## 5. The cost of the defeat, for the record
 
-- *Solve count*: 17 against 21, and on the 30 non-defective statements 17
-  against 21 of 30. Pass@any over both arms: 22 of 36.
+- *Solve count*: 19 against 23, and on the 30 non-defective statements 19
+  against 23 of 30. Pass@any over both arms: 24 of 36.
 - *Wall*: 46.9 h against 31.7 h, a 48 % premium; on the 16 problems both
-  solved, 816 against 497 min (1.6x), model time 329 against 263 min, tool
+  solved and judged in the run (the two rejudged problems ran to the wall
+  on both arms waiting on the dead verifier and are left out of this
+  comparison), 816 against 497 min (1.6x), model time 329 against 263 min, tool
   time 486 against 233 min, completion tokens 1.82 M against 1.51 M. The
   forced arm did not save reasoning on the problems it solved, as on the
   IMO set; it added prover time.
@@ -353,14 +379,30 @@ Section 3, not the size of a Putnam problem.
 
 ## 8. What I would run next
 
-1. Rep 1 of the 20 unsolved problems on the `skeleton` arm, same wall,
-   against the existing plain rows: the owner's hypothesis as a single
-   contrast, 20 attempts, about 25 h of wall at this run's rate.
-2. Item 6 first, since it is free: it tells us whether item 1 would have
-   closed the five lost problems' open leaves before we pay for a run.
-3. Report the five benchmark defects to PutnamBench with the disproofs.
+The owner's constraint (2026-11-14): no 18-problem rerun yet; small tests
+first, each one deciding whether the next is worth paying for.
 
-Limits of this note: one attempt per cell; a 2 h wall that cut fifteen
+1. *Done, free.* Judge the four unjudged files: all four PASS (above).
+2. *Free, about 2 h of server time.* Item 6 of Section 7 as
+   `scripts/replay_leaves.py`: every forced failure's final skeleton sent to
+   the filler as-is and once more with the file's `*_def` facts handed to
+   each leaf (`using f_def ... sorry`), closure compared per leaf. If the
+   facts variant closes a fair share, item 1 of Section 7 is worth building;
+   if the control also closes many, the pass lost those leaves to load and
+   timeouts, not to the goals.
+3. *Paid, three attempts, 2 h cap each.* `subsets/putnam-small3.txt`
+   (1963 A6, 2015 A3, 1981 B5: plain solved in 0.7 to 1.0 h, forced timed
+   out with 19, 18 and 14 open leaves) on the `skeleton` arm, which keeps the
+   automatic filler and drops the leaf rule; this isolates the rule's cost
+   from the filler's. Needs the owner's go.
+4. *Paid, three attempts, only after 2 and 3.* The same three problems on
+   `skeleton_forced` with the fact-aware probe (Section 7, item 1) in the
+   server, against the plain rows and the item-3 rows.
+5. Report the five benchmark defects to PutnamBench with the disproofs.
+6. The 18-problem rep 1 (every problem not solved by both arms) only if 3
+   or 4 shows a change worth its 20-odd hours of wall.
+
+Limits of this note: one attempt per cell; a 2 h wall that cut thirteen
 forced attempts while their fill closure was 60 to 95 %, so part of the
 "loss" is the forced arm being slower rather than unable; and my reading of
 the open goals (Section 3) is by eye, not by replay, which item 6 would
