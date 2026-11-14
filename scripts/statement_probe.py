@@ -69,7 +69,7 @@ async def _probe_once(gym: PoolAsyncClient, entry: dict, variant: str, sh_timeou
     try:
         # 1. parse: load the whole staged document
         rep = await gym.load_document(sid, text, report=True, timeout=load_timeout, lease_id=lease)
-        cmds = rep.get("commands") or []
+        cmds = (rep.get("report") or {}).get("commands") or []   # the report is nested under `report`
         errs = [f"line {c.get('line')} [{c.get('kind')}]: {m.get('text','')[:200]}"
                 for c in cmds for m in (c.get("messages") or []) if m.get("sev") == "error"]
         out["parses"] = bool(rep.get("success")) and not errs

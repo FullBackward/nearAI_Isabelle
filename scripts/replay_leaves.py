@@ -151,6 +151,13 @@ def selftest() -> int:
     assert r0["simp+algebra_simps"] == "(simp add: algebra_simps)", r0
     assert r["auto+field_simps"] == "(auto simp add: f_def g.simps field_simps)", r
     assert r0["auto+intros"] == "(auto intro!: continuous_intros tendsto_eq_intros derivative_eq_intros)", r0
+    rep = {"timed_out": True, "commands": [
+        {"line": 5, "status": "ok", "messages": []}, {"line": 5, "status": "ok", "messages": []},
+        {"line": 8, "status": "ok", "messages": []}, {"line": 8, "status": "failed", "messages": [{"sev": "error", "text": "Failed"}]},
+        {"line": 10, "status": "running", "messages": []},
+    ]}
+    assert leaf_verdicts(rep, [5, 8, 10, 12]) == {5: "closed", 8: "failed", 10: "unknown", 12: "unknown"}, leaf_verdicts(rep, [5, 8, 10, 12])
+    assert _errors(rep) == {8: "Failed"}
     print("replay_leaves selftest ok")
     return 0
 
@@ -175,39 +182,69 @@ class _Session:
         except Exception:  # noqa: BLE001
             pass
 
-    async def load(self, text: str) -> list[dict]:
-        """Load the document; the per-command report. A 404 (session gone) gets one fresh session."""
+    async def load(self, text: str, timeout: float | None = None) -> dict:
+        """Load the document; returns the server's per-command *report* (`{timed_out, commands,
+        success, error}`, nested under `report` in the client's response). A 404 (session gone)
+        gets one fresh session."""
         for attempt in (1, 2):
             try:
-                rep = await self.gym.load_document(self.sid, text, report=True, timeout=self.args.load_timeout,
-                                                   lease_id=self.lease)
-                return rep.get("commands") or []
+                resp = await self.gym.load_document(self.sid, text, report=True,
+                                                    timeout=timeout or self.args.load_timeout, lease_id=self.lease)
+                return resp.get("report") or {}
             except Exception as e:  # noqa: BLE001
                 if attempt == 2 or "404" not in str(e):
                     raise
                 s = await self.gym.acquire_session(theories=self.entry["imports"], field=self.entry["field"])
                 self.sid, self.lease = s["session_id"], s["lease_id"]
-        return []
+        return {}
 
 
-def _errors(cmds: list[dict]) -> dict[int, str]:
+def _errors(report: dict) -> dict[int, str]:
     out: dict[int, str] = {}
-    for c in cmds:
+    for c in (report.get("commands") or []):
         for m in (c.get("messages") or []):
             if m.get("sev") == "error":
                 out.setdefault(int(c.get("line") or 0), str(m.get("text", ""))[:160])
     return out
 
 
+def leaf_verdicts(report: dict, lines: list[int]) -> dict[int, str]:
+    """closed / failed / unknown per leaf line. A line may start several commands (`have ... by ...`
+    on one line is two); the leaf is closed only if every command starting on that line has
+    status `ok` and no error message; `failed` on any is failed; a command still `running` or
+    `unprocessed` (the load timed out before reaching it) is unknown; a line the report never
+    mentions is unknown too."""
+    per_line: dict[int, list[dict]] = {}
+    for c in (report.get("commands") or []):
+        per_line.setdefault(int(c.get("line") or 0), []).append(c)
+    out = {}
+    for ln in lines:
+        cmds = per_line.get(ln)
+        if not cmds:
+            out[ln] = "unknown"; continue
+        statuses = {c.get("status") for c in cmds}
+        has_err = any(m.get("sev") == "error" for c in cmds for m in (c.get("messages") or []))
+        if has_err or "failed" in statuses:
+            out[ln] = "failed"
+        elif statuses <= {"ok"}:
+            out[ln] = "closed"
+        else:
+            out[ln] = "unknown"
+    return out
+
+
 async def fill_variant(s: _Session, text: str, label: str, args) -> dict:
     out: dict = {"label": label, "sorries": count_sorries(text)}
     t0 = time.time()
-    errs = _errors(await s.load(text))
+    report = await s.load(text)
+    errs = _errors(report)
     if errs:   # a rewrite the context rejects (a fact name out of scope) is an error at that line
         out.update(parses=False, errors=[f"line {k}: {v}" for k, v in sorted(errs.items())[:5]],
                    elapsed_s=round(time.time() - t0, 1))
         return out
     out["parses"] = True
+    if report.get("timed_out"):
+        out["load_timed_out"] = True   # the fill then runs on a document still being checked
     total = min(args.max_total, out["sorries"] * args.timeout + 120)
     job = await s.gym.fill_sorries(s.sid, text, mode="document", timeout_s=args.timeout, max_total_s=total,
                                    load_timeout=args.load_timeout, lease_id=s.lease, try0_s=args.try0,
@@ -233,17 +270,19 @@ async def heuristic_variant(s: _Session, text: str, defs: list[str], simps: list
     for h in HEURISTICS:
         t0 = time.time()
         doc, lines = with_method(text, h, defs, simps)
-        out["methods"][h] = {}
         try:
-            errs = _errors(await s.load(doc))
+            report = await s.load(doc, timeout=args.heur_timeout)
         except Exception as e:  # noqa: BLE001
             out["methods"][h] = {"error": f"{type(e).__name__}: {e}"[:200], "elapsed_s": round(time.time() - t0, 1)}
             continue
-        closed = [ln for ln in lines if ln not in errs]
+        verdicts = leaf_verdicts(report, lines)
+        closed = [ln for ln, v in verdicts.items() if v == "closed"]
+        unknown = [ln for ln, v in verdicts.items() if v == "unknown"]
         # an error elsewhere than a leaf line means the document itself broke (should not happen:
         # the control variant loaded clean); record it so the count is not trusted blindly
-        foreign = {k: v for k, v in errs.items() if k not in lines}
-        out["methods"][h] = {"closed": closed, "n": len(closed), "elapsed_s": round(time.time() - t0, 1),
+        foreign = {k: v for k, v in _errors(report).items() if k not in lines}
+        out["methods"][h] = {"closed": closed, "n": len(closed), "unknown": len(unknown),
+                             "timed_out": bool(report.get("timed_out")), "elapsed_s": round(time.time() - t0, 1),
                              **({"foreign_errors": list(foreign.items())[:3]} if foreign else {})}
         closed_any |= set(closed)
     out["closed_any"] = sorted(closed_any)
@@ -319,7 +358,8 @@ async def main_async(args) -> int:
             if "error" in rec:
                 print(f"{p:16} sorries {n:3}  ERROR {rec['error']}", flush=True); return
             hs = rec.get("heuristics", {}).get("methods", {})
-            hline = " ".join(f"h{i}={v.get('n', 'err')}" for i, v in enumerate(hs.values(), 1)) if hs else "heuristics off"
+            hline = " ".join(f"h{i}={v.get('n', 'err')}" + (f"?{v['unknown']}" if v.get("unknown") else "")
+                             for i, v in enumerate(hs.values(), 1)) if hs else "heuristics off"
             print(f"{p:16} sorries {n:3}  control {_fmt(rec['control'])}  facts {_fmt(rec['facts'])}  "
                   f"{hline}  closed by any: {len(rec['closed_by_any'])}"
                   + (f"  [{rec['control'].get('errors') or rec['facts'].get('errors')}]"
@@ -358,6 +398,8 @@ def main() -> int:
     p.add_argument("--max-total", type=float, default=3600.0)
     p.add_argument("--max-sorries", type=int, default=60)
     p.add_argument("--load-timeout", type=float, default=300.0)
+    p.add_argument("--heur-timeout", type=float, default=180.0,
+                   help="document load budget per heuristic method; leaves not reached count as unknown (h=n?k)")
     p.add_argument("--gym-url", default=ib.GYM_URL)
     args = p.parse_args()
     if args.selftest:
